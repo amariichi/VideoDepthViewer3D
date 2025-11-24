@@ -68,7 +68,7 @@ VideoDepthViewer3D is a high-performance streaming MP4 depth viewer. It decodes 
 ### Configuration
 You can tune performance via backend environment variables and frontend URL parameters.
 
-For a full breakdown of optimization strategies and telemetry knobs, see [`OPTIMIZATION_DETRAILS.md`](OPTIMIZATION_DETAILS.md).
+For a full breakdown of optimization strategies and telemetry knobs, see [`OPTIMIZATION_DETAILS.md`](OPTIMIZATION_DETAILS.md).
 
 **Backend Environment Variables:**
 
@@ -159,7 +159,7 @@ VideoDepthViewer3D は、MP4 動画をリアルタイムに深度推定して 3D
 ### 設定一覧
 環境変数（バックエンド）と URL パラメータ（フロントエンド）でパフォーマンスを調整できます。
 
-最適化の仕組みや計測項目の詳しい解説は [`OPTIMIZATION_DETRAILS.md`](OPTIMIZATION_DETAILS.md) を参照してください。
+最適化の仕組みや計測項目の詳しい解説は [`OPTIMIZATION_DETAILS.md`](OPTIMIZATION_DETAILS.md) を参照してください。
 
 **バックエンド環境変数:**
 
