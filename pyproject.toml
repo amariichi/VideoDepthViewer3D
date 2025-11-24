@@ -1,6 +1,6 @@
 [project]
 name = "videodepthviewer3d"
-version = "1.0.2"
+version = "1.0.4"
 description = "Streaming Video Depth viewer backend"
 authors = [{ name = "Codex" }]
 readme = "README.md"

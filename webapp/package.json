@@ -1,7 +1,7 @@
 {
   "name": "webapp",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.4",
   "type": "module",
   "scripts": {
     "dev": "VITE_API_BASE=http://127.0.0.1:8000 vite --host",

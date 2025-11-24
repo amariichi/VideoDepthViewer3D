@@ -39,6 +39,9 @@ VideoDepthViewer3D is a high-performance streaming MP4 depth viewer. It decodes 
    ./start.sh
    ```
    This starts both the backend (port 8000) and frontend (port 5173).
+   
+   > [!NOTE]
+   > **First Run:** On the very first run, the application will download the Depth Anything 3 model (**approx. 1.3GB**). This may take some time. Please check the console for progress. Once the depth inference starts successfully, it is recommended to **restart the application** once for optimal stability.
 
    > [!IMPORTANT]
    > **Restarting the App:** If you need to restart the application, please **close the browser tab first** before running the script again. This ensures a clean state for the frontend connection.
@@ -122,14 +125,24 @@ VideoDepthViewer3D は、MP4 動画をリアルタイムに深度推定して 3D
    uv pip install -e ".[dev,inference]"
    uv pip install "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3@main"
    ```
-2. **バックエンド起動（高負荷向け例）:**
+2. **ワンクリック起動（推奨）:**
+   ```bash
+   ./start.sh
+   ```
+  このスクリプトは、バックエンド (port 8000) とフロントエンド (port 5173) の両方を起動します。
+
+   > [!NOTE]
+   > **初回起動時:** 初回実行時には Depth Anything 3 モデル（**約 1.3GB**）のダウンロードが発生するため、デプス推論の開始まで時間がかかります。進捗はコンソールを確認してください。無事デプス推論が開始されたら、**一旦アプリを終了し、再度立ち上げ直す**と挙動が安定するため推奨します。
+
+   > [!IMPORTANT]
+   > **アプリの再起動について:** アプリを終了して再度実行する場合には、**一旦ブラウザを閉じてから**実行してください。フロントエンドの接続状態をリセットして誤動作を防ぐためです。   
+
+3. **バックエンド起動（高負荷向け例）:**
    ```bash
    VIDEO_DEPTH_INFER_WORKERS=4 VIDEO_DEPTH_DOWNSAMPLE=4 UV_CACHE_DIR=.uv-cache DA3_LOG_LEVEL=WARN \
    uv run python3 scripts/run_backend.py
    ```
 
-   > [!IMPORTANT]
-   > **アプリの再起動について:** アプリを終了して再度実行する場合には、**一旦ブラウザを閉じてから**実行してください。フロントエンドの接続状態をリセットして誤動作を防ぐためです。
 3. **フロントエンド起動:**
    ```bash
    cd webapp

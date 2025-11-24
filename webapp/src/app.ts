@@ -51,6 +51,21 @@ export class VideoDepthApp {
       }
     );
 
+    // Manual Open Video button handler to ensure video is paused BEFORE file dialog opens
+    const openBtn = root.querySelector('#btn-open-file');
+    const fileInput = root.querySelector('#video-file') as HTMLInputElement;
+
+    openBtn?.addEventListener('click', () => {
+      // 1. Pause video immediately (stability fix)
+      if (this.videoEl && !this.videoEl.paused) {
+        this.videoEl.pause();
+      }
+      // 2. Trigger the hidden file input
+      fileInput?.click();
+    });
+
+
+
     usePlayerStore.subscribe((state) => {
       this.renderScene.updateControls(state.viewerControls);
     });
