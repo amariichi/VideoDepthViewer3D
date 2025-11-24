@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+body {
+  @apply bg-tropical-bg text-tropical-text;
+}
+
+/* Custom overrides for lil-gui to match light theme */
+.lil-gui {
+  --background-color: #ffffff;
+  --text-color: #263238;
+  --title-background-color: #eceff1;
+  --title-text-color: #263238;
+  /* Explicitly set title text color */
+  --widget-color: #eceff1;
+  --hover-color: #cfd8dc;
+  --focus-color: #00897b;
+  --number-color: #00897b;
+  --string-color: #00897b;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  width: 100%;
+  --width: 100%;
+}
+
+/* Force title color if variable doesn't work */
+.lil-gui .title {
+  color: var(--title-text-color, #263238);
+  font-weight: 600;
+  /* Make it slightly bolder */
+}
+
+/* Ensure video fills container */
+#source-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.lil-gui.autoPlace {
+  top: auto;
+  bottom: 0;
+  right: 16px;
+}
