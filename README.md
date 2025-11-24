@@ -89,7 +89,7 @@ For a full breakdown of optimization strategies and telemetry knobs, see [`OPTIM
 - `?debug=true`: Enable verbose logging (Health stats, Perf metrics) in browser console.
 
 ### Optimization Details
-See [`OPTIMIZATION_DETRAILS.md`](OPTIMIZATION_DETRAILS.md) for optimization internals and telemetry.
+See [`OPTIMIZATION_DETAILS.md`](OPTIMIZATION_DETAILS.md) for optimization internals and telemetry.
 
 ### License & Acknowledgements
 This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
@@ -178,7 +178,7 @@ VideoDepthViewer3D は、MP4 動画をリアルタイムに深度推定して 3D
 - `?maxInflight=N`: 同時リクエスト数の上限（デフォルト 8）。RTT が小さければ **16〜32**、大きければ **4〜8** へ。
 
 ### 最適化ドキュメント
-最適化の仕組みや計測項目の詳しい解説は [`OPTIMIZATION_DETRAILS.md`](OPTIMIZATION_DETRAILS.md) を参照してください。
+最適化の仕組みや計測項目の詳しい解説は [`OPTIMIZATION_DETAILS.md`](OPTIMIZATION_DETAILS.md) を参照してください。
 
 ### License & Acknowledgements
 This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
