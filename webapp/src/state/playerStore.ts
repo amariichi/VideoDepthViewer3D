@@ -1,5 +1,6 @@
 import { createStore } from 'zustand/vanilla';
 import type { SessionInfo, ViewerControls, PerfSettings } from '../types';
+import type { DepthClient } from '../network/depthClient'; // 追加（type import）
 
 export interface PlayerState {
   video: HTMLVideoElement | null;
@@ -7,11 +8,11 @@ export interface PlayerState {
   viewerControls: ViewerControls;
   perfSettings: PerfSettings;
   depthConnected: boolean;
-  depthClient: any | null; // Using any to avoid circular dependency for now, or import DepthClient type
+  depthClient: DepthClient | null;
   setVideo: (video: HTMLVideoElement) => void;
   setSession: (session: SessionInfo | null) => void;
   setDepthConnected: (connected: boolean) => void;
-  setDepthClient: (client: any | null) => void;
+  setDepthClient: (client: DepthClient | null) => void;
   updateControls: (patch: Partial<ViewerControls>) => void;
   updatePerfSettings: (patch: Partial<PerfSettings>) => void;
 }

@@ -1,7 +1,8 @@
 import pako from 'pako';
-import type { DepthFrame, PerfSettings } from '../types';
+import type { DepthFrame, DepthStatus, PerfSettings } from '../types';
 import { DEPTH_HEADER_SIZE, DEPTH_MAGIC, DEPTH_MAGIC_COMPRESSED } from '../types';
 import { wsUrl } from '../utils/env';
+import { getSessionStatus } from './sessionApi';
 
 type DepthListener = (frame: DepthFrame) => void;
 type StatusListener = (state: { connected: boolean }) => void;
@@ -281,16 +282,9 @@ export class DepthClient {
     };
   }
 
-  async getStats(): Promise<any> {
+  async getStats(): Promise<DepthStatus | null> {
     try {
-      const response = await fetch(`/api/sessions/${this.sessionId}/status`);
-      if (!response.ok) {
-        console.warn('getStats failed', response.status, response.statusText);
-        return null;
-      }
-      const data = await response.json();
-      // console.debug('getStats data', data);
-      return data;
+      return await getSessionStatus(this.sessionId);
     } catch (e) {
       console.error('getStats error', e);
       return null;

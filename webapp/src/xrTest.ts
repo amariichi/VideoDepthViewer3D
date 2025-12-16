@@ -196,9 +196,16 @@ export class RawXRTest {
 
     const session = await this.requestSessionWithFallback();
 
-    if (typeof (gl as any).makeXRCompatible === 'function') {
-      await (gl as any).makeXRCompatible();
+    type XRCompatibleWebGL2 = WebGL2RenderingContext & {
+      makeXRCompatible?: () => Promise<void>;
+    };
+
+    const glXR = gl as XRCompatibleWebGL2;
+
+    if (typeof glXR.makeXRCompatible === "function") {
+      await glXR.makeXRCompatible();
     }
+
     const baseLayer = new XRWebGLLayer(session, gl, { antialias: true, alpha: false });
     session.updateRenderState({ baseLayer });
 
@@ -703,7 +710,11 @@ export class RawXRTest {
           float depth = texture(uDepthTex, vUv).r;
           
           depth = pow(max(depth, 0.0), uZGamma);
-          float z = clamp(depth * uZScale + uZBias, 0.0, uZMaxClip);
+          // Clip only the depth-derived component. Bias is a global offset and
+          // should not be clamped, otherwise it saturates Z to a constant and
+          // the mesh looks flat.
+          float zDepth = clamp(depth * uZScale, 0.0, uZMaxClip);
+          float z = zDepth + uZBias;
           // 右手系: +X が右。元は符号が逆で背面を向いていた。\n
           float x = (aUv.x - 0.5) * uAspect * uPlaneScale;\n
           float y = (0.5 - aUv.y) * uPlaneScale;\n
@@ -784,7 +795,7 @@ export class RawXRTest {
     const epsilon = Math.max(targetTriangles, 10);
     const nxFloat = Math.sqrt((epsilon * Math.max(aspect, 0.1)) / 2);
     const nyFloat = Math.sqrt(epsilon / (2 * Math.max(aspect, 0.1)));
-    let segmentsX = Math.max(2, Math.round(nxFloat));
+    const segmentsX = Math.max(2, Math.round(nxFloat));
     let segmentsY = Math.max(2, Math.round(nyFloat));
     if (aspect < 1 && segmentsY > 1024) {
       const stride = Math.ceil(segmentsY / 1024);
@@ -915,21 +926,32 @@ export class RawXRTest {
 
     if (!anyGamepad) {
       // fallback: try navigator.getGamepads (LinkでinputSourcesが空になる場合がある)
-      const gps = (navigator as any).getGamepads ? (navigator as any).getGamepads() : [];
-      const gp = gps && gps.length ? gps.find((g: Gamepad | null) => g && g.axes.length >= 2) : null;
+      const gps =
+        "getGamepads" in navigator && typeof navigator.getGamepads === "function"
+          ? navigator.getGamepads()
+          : [];
+
+      const gp =
+        gps && gps.length
+          ? gps.find((g): g is Gamepad => !!g && g.axes.length >= 2)
+          : null;
+    
       if (gp) {
         anyGamepad = true;
-        const [sx, sy] = pickStick(gp.axes as unknown as number[]);
+    
+        const [sx, sy] = pickStick(gp.axes);
         const axX = Math.abs(sx) > deadzone ? sx : 0;
         const axY = Math.abs(sy) > deadzone ? sy : 0;
+    
         const state = this.input.right;
         state.axes = [axX, axY];
         state.select = gp.buttons[0]?.pressed ?? false;
         state.squeeze = gp.buttons[1]?.pressed ?? false;
         state.ts = now;
-        this.logInput('[XR] using navigator.getGamepads fallback');
+
+        this.logInput("[XR] using navigator.getGamepads fallback");
       } else {
-        this.logInput('[XR] no gamepad axes (sources=' + sources.length + ', gp=0)');
+        this.logInput("[XR] no gamepad axes (sources=" + sources.length + ", gp=0)");
       }
     }
 
@@ -1053,10 +1075,29 @@ export class RawXRTest {
 
   private updateDebugOverlay(primary: ControllerState, sourcesLen: number): void {
     if (!this.debugEl) return;
-    const fmt = (s: ControllerState) => `${s.hand}: sel=${s.select ? 1 : 0} sq=${s.squeeze ? 1 : 0} ax=${s.axes.map(v => v.toFixed(2)).join(',')}`;
-    const gps = (navigator as any).getGamepads ? (navigator as any).getGamepads() : [];
-    const firstGp = gps && gps.length ? gps.find((g: Gamepad | null) => g) : null;
-    const gpTxt = firstGp ? `gp axes=${firstGp.axes.map((v: number) => v.toFixed(2)).join(',')} btn=${firstGp.buttons.map((b: GamepadButton) => (b?.pressed ? 1 : 0)).join('')}` : 'gp none';
-    this.debugEl.textContent = `sources=${sourcesLen} | ${fmt(this.input.left)} | ${fmt(this.input.right)} | active=${primary.hand} | ${gpTxt}`;
+  
+    const fmt = (s: ControllerState) =>
+      `${s.hand}: sel=${s.select ? 1 : 0} sq=${s.squeeze ? 1 : 0} ax=${s.axes
+        .map((v) => v.toFixed(2))
+        .join(",")}`;
+  
+    const gps =
+      "getGamepads" in navigator && typeof navigator.getGamepads === "function"
+        ? navigator.getGamepads()
+        : [];
+  
+    const firstGp =
+      gps && gps.length
+        ? gps.find((g): g is Gamepad => !!g)
+        : null;
+  
+    const gpTxt = firstGp
+      ? `gp axes=${firstGp.axes.map((v) => v.toFixed(2)).join(",")} btn=${firstGp.buttons
+          .map((b) => (b?.pressed ? 1 : 0))
+          .join("")}`
+      : "gp none";
+  
+    this.debugEl.textContent =
+      `sources=${sourcesLen} | ${fmt(this.input.left)} | ${fmt(this.input.right)} | active=${primary.hand} | ${gpTxt}`;
   }
 }

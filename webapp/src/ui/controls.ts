@@ -121,10 +121,10 @@ export class ControlPanel {
           stats.infer = parseFloat(data.telemetry.infer_s?.toFixed(3) ?? '0');
           stats.pack = parseFloat(data.telemetry.pack_s?.toFixed(3) ?? '0');
           stats.send = parseFloat(data.telemetry.ws_send_s?.toFixed(3) ?? '0');
-          stats.inflight = parseInt(data.telemetry.inflight_used ?? '0');
+          stats.inflight = Math.trunc(data.telemetry.inflight_used ?? 0);
         }
         if (data && data.config) {
-          stats.res = parseInt(data.config.process_res ?? '0');
+          stats.res = Math.trunc(data.config.process_res ?? 0);
         }
         if (data && data.rolling_stats) {
           // stats.fps = parseFloat(data.rolling_stats.depth_fps?.toFixed(1) ?? '0');

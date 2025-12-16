@@ -45,6 +45,7 @@ export class RenderScene {
     new THREE.PerspectiveCamera(50, 1, 0.01, 1000),
   ];
   private rawXRViewport = new THREE.Vector4();
+  private manualPrevXREnabled: boolean | null = null;
 
   constructor(
     container: HTMLElement,
@@ -68,8 +69,14 @@ export class RenderScene {
       alpha: false,
       preserveDrawingBuffer: false,
     });
-    if (typeof (gl as any).makeXRCompatible === 'function') {
-      (gl as any).makeXRCompatible().catch((err: unknown) => console.warn('makeXRCompatible failed', err));
+    type XRCompatibleWebGL2 = WebGL2RenderingContext & {
+      makeXRCompatible?: () => Promise<void>;
+    };
+    const glXR = gl as XRCompatibleWebGL2;
+    if (typeof glXR.makeXRCompatible === 'function') {
+      glXR.makeXRCompatible().catch((err: unknown) =>
+        console.warn('makeXRCompatible failed', err)
+      );
     }
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(container.clientWidth, container.clientHeight);
@@ -586,7 +593,7 @@ export class RenderScene {
       this.stopManualXR();
     });
     // remember state to restore when stopping
-    (this.renderer.xr as any)._manualPrevEnabled = prevEnabled;
+    this.manualPrevXREnabled = prevEnabled;
     this.manualXRLoop();
   }
 
@@ -605,10 +612,9 @@ export class RenderScene {
     this.rawXRRefSpace = null;
     this.rawXRLoopHandle = null;
     // restore three.js XR flag if we disabled it
-    const prev = (this.renderer.xr as any)._manualPrevEnabled;
-    if (typeof prev === 'boolean') {
-      this.renderer.xr.enabled = prev;
-      (this.renderer.xr as any)._manualPrevEnabled = undefined;
+    if (this.manualPrevXREnabled !== null) {
+      this.renderer.xr.enabled = this.manualPrevXREnabled;
+      this.manualPrevXREnabled = null;
     }
   }
 
@@ -668,28 +674,36 @@ export class RenderScene {
     // official polyfill load (no types available)
     const anyWin = window as typeof window & { __lgPolyfill?: boolean };
     if (anyWin.__lgPolyfill) return;
-    // Prefer local dependency; fallback to CDN 0.6.0
+
+    type LookingGlassPolyfillCtor = new (opts: Record<string, unknown>) => unknown;
+    type LGModule = { LookingGlassWebXRPolyfill?: LookingGlassPolyfillCtor };
+
     const urls = [
       '@lookingglass/webxr/dist/bundle/webxr.js',
       'https://unpkg.com/@lookingglass/webxr@0.6.0/dist/bundle/webxr.js',
     ];
-    let mod: any = null;
+
+    let mod: LGModule | null = null;
+
     for (const url of urls) {
       try {
-        mod = await import(/* @vite-ignore */ url);
+        const imported = (await import(/* @vite-ignore */ url)) as unknown;
+        mod = imported as LGModule;
         break;
       } catch (err) {
         console.warn('LG polyfill load failed', url, err);
       }
     }
+
     if (!mod) {
       throw new Error('Looking Glass polyfill could not be loaded');
     }
-    const Polyfill = mod?.LookingGlassWebXRPolyfill;
+
+    const Polyfill = mod.LookingGlassWebXRPolyfill;
     if (!Polyfill) {
       throw new Error('LookingGlassWebXRPolyfill not found');
     }
-    // Instantiate with defaults; users can tune via global config if needed
+
     new Polyfill({});
     anyWin.__lgPolyfill = true;
   }

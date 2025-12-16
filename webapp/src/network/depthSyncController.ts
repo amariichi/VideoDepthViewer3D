@@ -1,4 +1,5 @@
 import type { DepthStatus, PerfSettings } from '../types';
+import { getSessionStatus } from './sessionApi';
 
 export class DepthSyncController {
     private intervalId: number | null = null;
@@ -32,9 +33,7 @@ export class DepthSyncController {
         if (!this.sessionId) return;
 
         try {
-            const res = await fetch(`/api/sessions/${this.sessionId}/status`);
-            if (!res.ok) return;
-            const status: DepthStatus = await res.json();
+            const status = await getSessionStatus(this.sessionId);
             this.adjustSettings(status);
         } catch (e) {
             console.error('SyncController poll failed', e);

@@ -169,7 +169,7 @@ export class VideoDepthApp {
 
   private async handleFileSelected(file: File): Promise<void> {
     await this.cleanupSession();
-    this.controlPanel.updateStatus('Uploading...');
+    this.controlPanel.updateStatus('アップロード中...');
     const session = await uploadVideo(file);
     this.currentSession = session;
     usePlayerStore.getState().setSession(session);

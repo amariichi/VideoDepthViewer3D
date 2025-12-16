@@ -21,7 +21,11 @@ export const vertexShader = /* glsl */ `
     vSampleUv = vec2(1.0 - uv.x, 1.0 - uv.y);
     float depth = readDepth(vSampleUv);
     depth = pow(max(depth, 0.0), zGamma);
-    float z = clamp(depth * zScale + zBias, 0.0, zMaxClip);
+    // Apply clipping to the depth-derived displacement only.
+    // Z Bias is a global offset and should not participate in clipping, otherwise
+    // non-zero bias easily saturates to a constant Z and the mesh appears flat.
+    float zDepth = clamp(depth * zScale, 0.0, zMaxClip);
+    float z = zDepth + zBias;
     float x = (0.5 - vUv.x) * aspect * planeScale;
     float y = (0.5 - vUv.y) * planeScale;
     vec4 displaced = vec4(x, y, -z, 1.0);
