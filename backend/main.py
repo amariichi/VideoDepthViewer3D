@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.routers import session as session_router
 from backend.routers import stream as stream_router
 from backend.config import get_settings
+from backend.video.session import get_session_manager
 
 
 def create_app() -> FastAPI:
@@ -30,6 +31,11 @@ def create_app() -> FastAPI:
     )
     app.include_router(session_router.router)
     app.include_router(stream_router.router)
+
+    @app.on_event("startup")
+    async def clear_cached_sessions() -> None:
+        await get_session_manager().clear_cache()
+
     return app
 
 

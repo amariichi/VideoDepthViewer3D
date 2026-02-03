@@ -266,7 +266,7 @@ export class RenderScene {
     uniforms.zScale.value = controls.zScale;
     uniforms.zBias.value = controls.zBias;
     uniforms.zGamma.value = controls.zGamma;
-    uniforms.zMaxClip.value = Math.min(controls.zMaxClip, frame.zMax);
+    uniforms.zMaxClip.value = controls.zMaxClip;
     uniforms.planeScale.value = controls.planeScale;
     const yOffset = this.renderer.xr.isPresenting ? controls.yOffset + this.vrYOffset : controls.yOffset;
     this.mesh.position.y = yOffset;

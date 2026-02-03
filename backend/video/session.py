@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Deque, Optional
 
 import numpy as np
+import logging
 from fastapi import UploadFile
 
 from backend.config import get_settings
@@ -205,6 +206,7 @@ class SessionManager:
         self._lock = asyncio.Lock()
 
     async def create_session(self, upload: UploadFile) -> VideoSession:
+        await self.clear_cache()
         data_root = self.settings.data_root
         data_root.mkdir(parents=True, exist_ok=True)
         session_id = uuid.uuid4().hex
@@ -245,6 +247,40 @@ class SessionManager:
     async def get(self, session_id: str) -> Optional[VideoSession]:
         async with self._lock:
             return self._sessions.get(session_id)
+
+    async def clear_cache(self) -> None:
+        data_root = self.settings.data_root
+        default_root = Path("tmp/sessions").resolve()
+        data_root_resolved = data_root.resolve()
+        if data_root_resolved != default_root and not self.settings.clear_cache_override:
+            logging.getLogger(__name__).warning(
+                "Skipping cache cleanup for data_root=%s (set VIDEO_DEPTH_CLEAR_CACHE=1 to override).",
+                data_root_resolved,
+            )
+            return
+
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+
+        for session in sessions:
+            session.decoder.close()
+            if session.source_path.exists():
+                session.source_path.unlink()
+            session_dir = session.source_path.parent
+            if session_dir.exists():
+                for child in session_dir.iterdir():
+                    child.unlink(missing_ok=True)
+                session_dir.rmdir()
+
+        if data_root.exists():
+            for child in data_root.iterdir():
+                if child.is_dir():
+                    for sub in child.iterdir():
+                        sub.unlink(missing_ok=True)
+                    child.rmdir()
+                else:
+                    child.unlink(missing_ok=True)
 
 
 def get_session_manager() -> SessionManager:

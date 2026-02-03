@@ -566,7 +566,7 @@ export class RawXRTest {
         gl.uniform1f(s.mesh.uniforms.zScale, controls.zScale);
         gl.uniform1f(s.mesh.uniforms.zBias, controls.zBias);
         gl.uniform1f(s.mesh.uniforms.zGamma, controls.zGamma);
-        gl.uniform1f(s.mesh.uniforms.zMaxClip, Math.min(controls.zMaxClip, depth.zMax));
+        gl.uniform1f(s.mesh.uniforms.zMaxClip, controls.zMaxClip);
         gl.uniform1f(s.mesh.uniforms.planeScale, controls.planeScale);
 
         gl.activeTexture(gl.TEXTURE0);

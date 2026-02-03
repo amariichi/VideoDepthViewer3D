@@ -82,6 +82,8 @@ For a full breakdown of optimization strategies and telemetry knobs, see [`OPTIM
 | `VIDEO_DEPTH_COMPRESSION` | `0` | Zlib level (0–9). 0 recommended for low latency. |
 | `VIDEO_DEPTH_PROFILE_TIMING` | `False` | Enable detailed timing logs. |
 | `VIDEO_DEPTH_LOG_LEVEL` | `WARNING` | Log level (DEBUG, INFO, WARNING, ERROR). Set to **INFO** to see stats. |
+| `VIDEO_DEPTH_DATA_ROOT` | `tmp/sessions` | Cache root directory for uploaded videos. Automatic cleanup only runs for the default `tmp/sessions` path unless `VIDEO_DEPTH_CLEAR_CACHE=1` is set. |
+| `VIDEO_DEPTH_CLEAR_CACHE` | `False` | Allow cache cleanup even when `VIDEO_DEPTH_DATA_ROOT` is not the default `tmp/sessions`. |
 | `UV_CACHE_DIR` | – | uv cache path (e.g., `.uv-cache`) to avoid download timeouts. |
 
 **Frontend URL Parameters:**
@@ -172,6 +174,8 @@ VideoDepthViewer3D は、MP4 動画をリアルタイムに深度推定して 3D
 | `VIDEO_DEPTH_CACHE` | `8` | デコード済みフレームのキャッシュ数。 |
 | `VIDEO_DEPTH_COMPRESSION` | `0` | Zlib 圧縮レベル（0–9）。低遅延のため **0（無効）** を推奨。 |
 | `VIDEO_DEPTH_PROFILE_TIMING` | `False` | 詳細なタイミングログを有効化。 |
+| `VIDEO_DEPTH_DATA_ROOT` | `tmp/sessions` | 動画キャッシュのルート。自動クリーンアップはデフォルトの `tmp/sessions` のみ対象で、別パスを使う場合は `VIDEO_DEPTH_CLEAR_CACHE=1` が必要です。 |
+| `VIDEO_DEPTH_CLEAR_CACHE` | `False` | `VIDEO_DEPTH_DATA_ROOT` がデフォルト以外でもキャッシュ削除を許可します。 |
 | `UV_CACHE_DIR` | – | uv のキャッシュパス（例: `.uv-cache`）。ダウンロード失敗を防止。 |
 
 **フロントエンド URL パラメータ:**

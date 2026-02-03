@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     uv_cache_dir: Path | None = None
     inference_worker_count: int = Field(default=3, validation_alias="VIDEO_DEPTH_INFER_WORKERS")
     log_level: str = Field(default="WARNING", validation_alias="VIDEO_DEPTH_LOG_LEVEL")
+    clear_cache_override: bool = Field(default=False, validation_alias="VIDEO_DEPTH_CLEAR_CACHE")
 
     model_config = {
         "frozen": True,

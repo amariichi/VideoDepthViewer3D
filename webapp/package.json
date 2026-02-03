@@ -1,7 +1,7 @@
 {
   "name": "webapp",
   "private": true,
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "scripts": {
     "dev": "VITE_API_BASE=http://127.0.0.1:8000 vite --host",
@@ -14,6 +14,7 @@
     "@eslint/js": "^9.39.2",
     "@types/pako": "^2.0.4",
     "autoprefixer": "^10.4.22",
+    "baseline-browser-mapping": "^2.9.19",
     "eslint": "^9.39.2",
     "postcss": "^8.5.6",
     "tailwindcss": "^3.4.17",
