@@ -20,6 +20,7 @@ export class VideoDepthApp {
   private depthBuffer = new DepthBuffer();
   private lastAspect = 0;
   private rawXR: RawXRTest | null = null;
+  private suppressSeekRefresh = false;
 
   constructor(root: HTMLElement) {
     // ... (existing constructor code)
@@ -31,6 +32,8 @@ export class VideoDepthApp {
     video.preload = 'metadata';
     root.querySelector('#video-container')?.appendChild(video);
     this.videoEl = video;
+    this.videoEl.addEventListener('ended', () => this.handleVideoEnded());
+    this.videoEl.addEventListener('seeked', () => this.handleVideoSeeked());
     usePlayerStore.getState().setVideo(video);
 
     const canvasContainer = root.querySelector('#canvas-container') as HTMLElement;
@@ -48,8 +51,18 @@ export class VideoDepthApp {
       {
         onFileSelected: async (file) => this.handleFileSelected(file),
         getFrontendFps: () => this.getFrontendFps(),
+        getViewDistance: () => this.renderScene.getViewDistance(),
+        onViewDistanceChanged: (distance) => this.renderScene.setViewDistance(distance),
+        getModelZOffset: () => this.renderScene.getModelZOffset(),
+        onModelZOffsetChanged: (offset) => this.renderScene.setModelZOffset(offset),
       }
     );
+    this.renderScene.setViewDistanceChangeHandler((distance) => {
+      this.controlPanel.setViewDistance(distance);
+    });
+    this.renderScene.setModelZOffsetChangeHandler((offset) => {
+      this.controlPanel.setModelZOffset(offset);
+    });
 
     // Manual Open Video button handler to ensure video is paused BEFORE file dialog opens
     const openBtn = root.querySelector('#btn-open-file');
@@ -84,8 +97,9 @@ export class VideoDepthApp {
     const rawVrBtn = document.getElementById('btn-vr') as HTMLButtonElement;
     const helpCheckbox = document.getElementById('chk-hints') as HTMLInputElement;
     const sbsBtn = document.getElementById('btn-sbs') as HTMLButtonElement;
+    const sbsSwapCheckbox = document.getElementById('chk-sbs-swap') as HTMLInputElement;
 
-    if (!rawVrBtn || !helpCheckbox || !sbsBtn) {
+    if (!rawVrBtn || !helpCheckbox || !sbsBtn || !sbsSwapCheckbox) {
       console.warn('XR buttons not found in DOM');
       return;
     }
@@ -152,6 +166,13 @@ export class VideoDepthApp {
       }
     });
     sbsBtn.dataset.enabled = 'false';
+    sbsSwapCheckbox.checked = false;
+    sbsSwapCheckbox.addEventListener('change', () => {
+      this.renderScene.setSbsSwapEyes(sbsSwapCheckbox.checked);
+      if (this.renderScene.isSbsEnabled()) {
+        this.controlPanel.updateStatus(sbsSwapCheckbox.checked ? 'SBS swap ON' : 'SBS swap OFF');
+      }
+    });
 
     // フルスクリーン解除時はSBSもOFFに戻す
     document.addEventListener('fullscreenchange', () => {
@@ -188,7 +209,6 @@ export class VideoDepthApp {
       this.startRenderLoop(); // Restart render loop
     };
     this.videoEl.addEventListener('loadeddata', onLoaded);
-    this.videoEl.addEventListener('ended', () => this.handleVideoEnded());
     this.videoEl.play();
   }
 
@@ -396,6 +416,7 @@ export class VideoDepthApp {
   private handleVideoEnded(): void {
     // Reset playback position and depth buffers so replay works
     this.depthBuffer.clear();
+    this.suppressSeekRefresh = true;
     this.videoEl.currentTime = 0;
     // Refresh depth stream connection to drop pending/inflight safely
     if (this.depthClient) {
@@ -403,6 +424,18 @@ export class VideoDepthApp {
       this.depthClient.connect();
     }
     // Let the user press play again; depth polling loop will pick up from t=0
+  }
+
+  private handleVideoSeeked(): void {
+    if (this.suppressSeekRefresh) {
+      this.suppressSeekRefresh = false;
+      return;
+    }
+    if (!this.depthClient || !this.currentSession) return;
+    // Drop stale future requests and frames after explicit timeline jumps.
+    this.depthBuffer.clear();
+    this.depthClient.close();
+    this.depthClient.connect();
   }
 
   private healthIntervalId: number | null = null;

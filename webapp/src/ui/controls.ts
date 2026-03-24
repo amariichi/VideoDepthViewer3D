@@ -4,6 +4,10 @@ import { usePlayerStore } from '../state/playerStore';
 interface ControlCallbacks {
   onFileSelected: (file: File) => Promise<void>;
   getFrontendFps: () => number;
+  getViewDistance: () => number;
+  onViewDistanceChanged: (distance: number) => void;
+  getModelZOffset: () => number;
+  onModelZOffsetChanged: (offset: number) => void;
 }
 
 interface ControlElements {
@@ -18,10 +22,16 @@ export class ControlPanel {
   private perfGui: GUI;
   private elements: ControlElements;
   private callbacks: ControlCallbacks;
+  private viewDistanceState = { cameraDistance: 3.5 };
+  private modelZState = { modelZOffset: 0 };
+  private cameraDistanceController: ReturnType<GUI['add']> | null = null;
+  private modelZController: ReturnType<GUI['add']> | null = null;
 
   constructor(elements: ControlElements, callbacks: ControlCallbacks) {
     this.elements = elements;
     this.callbacks = callbacks;
+    this.viewDistanceState.cameraDistance = this.callbacks.getViewDistance();
+    this.modelZState.modelZOffset = this.callbacks.getModelZOffset();
     this.depthGui = new GUI({ container: elements.depthGui, title: 'Depth Controls' });
     this.perfGui = new GUI({ container: elements.perfGui, title: 'Performance' });
     this.mountFileInput();
@@ -41,11 +51,26 @@ export class ControlPanel {
   private mountSliders(): void {
     const store = usePlayerStore.getState();
     const folder = this.depthGui; // no extra nesting
+    folder
+      .add(store.viewerControls, 'projectionMode', { Relief: 'relief', Pinhole: 'pinhole' })
+      .name('Projection')
+      .onChange((value: 'relief' | 'pinhole') => {
+        usePlayerStore.getState().updateControls({ projectionMode: value });
+      });
     folder.add(store.viewerControls, 'targetTriangles', 50_000, 300_000, 10_000).name('Target tris').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ targetTriangles: value });
     });
-    folder.add(store.viewerControls, 'fovY', 30, 90, 1).name('FOV Y').onChange((value: number) => {
+    folder.add(store.viewerControls, 'fovY', 30, 90, 1).name('View FOV Y').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ fovY: value });
+    });
+    folder.add(store.viewerControls, 'sourceFovY', 30, 100, 1).name('Source FOV Y').onChange((value: number) => {
+      usePlayerStore.getState().updateControls({ sourceFovY: value });
+    });
+    this.cameraDistanceController = folder.add(this.viewDistanceState, 'cameraDistance', 0.2, 10.0, 0.05).name('Camera Dist').onChange((value: number) => {
+      this.callbacks.onViewDistanceChanged(value);
+    });
+    this.modelZController = folder.add(this.modelZState, 'modelZOffset', -5.0, 5.0, 0.05).name('Model Z').onChange((value: number) => {
+      this.callbacks.onModelZOffsetChanged(value);
     });
     folder.add(store.viewerControls, 'zScale', 0.5, 5.0, 0.05).name('Z Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zScale: value });
@@ -138,5 +163,15 @@ export class ControlPanel {
 
   updateStatus(message: string): void {
     this.elements.status.textContent = message;
+  }
+
+  setViewDistance(distance: number): void {
+    this.viewDistanceState.cameraDistance = distance;
+    this.cameraDistanceController?.updateDisplay();
+  }
+
+  setModelZOffset(offset: number): void {
+    this.modelZState.modelZOffset = offset;
+    this.modelZController?.updateDisplay();
   }
 }

@@ -3,6 +3,7 @@ import * as THREE from 'three';
 // VRButton unused (RawXRに統一)
 import type { DepthFrame, ViewerControls } from '../types';
 import { createGridGeometry } from './mesh';
+import { getProjectionMix, getTanHalfSourceFovY } from './projection';
 import { fragmentShader, vertexShader } from './shaders';
 import { perfStats } from '../utils/perfStats';
 
@@ -30,6 +31,7 @@ export class RenderScene {
   private readonly xrTarget = new THREE.Vector3(0, 0.6, -1.0);
   private readonly ipd = 0.064; // meters
   private sbsEnabled = false;
+  private sbsSwapEyes = false;
   private vrYOffset = -1.4; // lower content in VR so中心が目線に来る
   private instructionBillboard: THREE.Sprite | null = null;
   private instructionsVisible = true;
@@ -46,6 +48,9 @@ export class RenderScene {
   ];
   private rawXRViewport = new THREE.Vector4();
   private manualPrevXREnabled: boolean | null = null;
+  private viewDistanceChangeHandler: ((distance: number) => void) | null = null;
+  private modelZOffsetChangeHandler: ((offset: number) => void) | null = null;
+  private modelZOffset = 0;
 
   constructor(
     container: HTMLElement,
@@ -93,6 +98,7 @@ export class RenderScene {
     const point = new THREE.PointLight(0xffffff, 0.8);
     point.position.set(2, 3, 2);
     this.scene.add(point);
+    this.orbitRadius = this.clampViewDistance(this.orbitRadius);
     this.camera = new THREE.PerspectiveCamera(initialControls.fovY, this.aspectRatio(), 0.01, 1000);
     this.camera.position.set(0, 1.4, this.orbitRadius);
     this.camera.lookAt(this.orbitTarget);
@@ -165,6 +171,43 @@ export class RenderScene {
     this.handleResize();
   }
 
+  public setSbsSwapEyes(enabled: boolean): void {
+    this.sbsSwapEyes = enabled;
+  }
+
+  public getViewDistance(): number {
+    return this.orbitRadius;
+  }
+
+  public setViewDistance(distance: number): void {
+    this.orbitRadius = this.clampViewDistance(distance);
+    if (!this.renderer.xr.isPresenting) {
+      this.updateCameraOrbit();
+    }
+    this.viewDistanceChangeHandler?.(this.orbitRadius);
+  }
+
+  public setViewDistanceChangeHandler(handler: (distance: number) => void): void {
+    this.viewDistanceChangeHandler = handler;
+  }
+
+  public getModelZOffset(): number {
+    return this.modelZOffset;
+  }
+
+  public setModelZOffset(offset: number): void {
+    const clamped = this.clampModelZOffset(offset);
+    this.modelZOffset = clamped;
+    if (!this.renderer.xr.isPresenting) {
+      this.applyMeshPlacement(false);
+    }
+    this.modelZOffsetChangeHandler?.(this.modelZOffset);
+  }
+
+  public setModelZOffsetChangeHandler(handler: (offset: number) => void): void {
+    this.modelZOffsetChangeHandler = handler;
+  }
+
   public isSbsEnabled(): boolean {
     return this.sbsEnabled;
   }
@@ -229,7 +272,9 @@ export class RenderScene {
       uniforms.zGamma.value = this.currentControls.zGamma;
       uniforms.zMaxClip.value = this.currentControls.zMaxClip;
       uniforms.planeScale.value = this.currentControls.planeScale;
-      this.mesh.position.y = this.currentControls.yOffset;
+      uniforms.projectionMix.value = getProjectionMix(this.currentControls);
+      uniforms.tanHalfSourceFovY.value = getTanHalfSourceFovY(this.currentControls);
+      this.applyMeshPlacement(this.renderer.xr.isPresenting);
     }
   }
 
@@ -268,8 +313,9 @@ export class RenderScene {
     uniforms.zGamma.value = controls.zGamma;
     uniforms.zMaxClip.value = controls.zMaxClip;
     uniforms.planeScale.value = controls.planeScale;
-    const yOffset = this.renderer.xr.isPresenting ? controls.yOffset + this.vrYOffset : controls.yOffset;
-    this.mesh.position.y = yOffset;
+    uniforms.projectionMix.value = getProjectionMix(controls);
+    uniforms.tanHalfSourceFovY.value = getTanHalfSourceFovY(controls);
+    this.applyMeshPlacement(this.renderer.xr.isPresenting);
     perfStats.add('scene.updateDepth', performance.now() - start);
   }
 
@@ -289,19 +335,20 @@ export class RenderScene {
       uniforms: {
         depthTexture: { value: this.depthTexture },
         videoTexture: { value: this.videoTexture },
-        depthSize: { value: new THREE.Vector2(1, 1) },
         aspect: { value: aspect },
         zScale: { value: controls.zScale },
         zBias: { value: controls.zBias },
         zGamma: { value: controls.zGamma },
         zMaxClip: { value: controls.zMaxClip },
         planeScale: { value: controls.planeScale },
+        projectionMix: { value: getProjectionMix(controls) },
+        tanHalfSourceFovY: { value: getTanHalfSourceFovY(controls) },
       },
       vertexShader,
       fragmentShader,
     });
     this.mesh = new THREE.Mesh(geometry, material);
-    this.mesh.position.set(0, controls.yOffset, 0.0);
+    this.applyMeshPlacement(this.renderer.xr.isPresenting);
     this.scene.add(this.mesh);
     perfStats.add('scene.rebuildMesh', performance.now() - start);
     this.startLoop();
@@ -365,15 +412,18 @@ export class RenderScene {
 
     this.renderer.setScissorTest(true);
 
+    const leftViewportCam = this.sbsSwapEyes ? this.sbsRightCam : this.sbsLeftCam;
+    const rightViewportCam = this.sbsSwapEyes ? this.sbsLeftCam : this.sbsRightCam;
+
     // left
     this.renderer.setViewport(0, 0, halfW, h);
     this.renderer.setScissor(0, 0, halfW, h);
-    this.renderer.render(this.scene, this.sbsLeftCam);
+    this.renderer.render(this.scene, leftViewportCam);
 
     // right
     this.renderer.setViewport(halfW, 0, halfW, h);
     this.renderer.setScissor(halfW, 0, halfW, h);
-    this.renderer.render(this.scene, this.sbsRightCam);
+    this.renderer.render(this.scene, rightViewportCam);
 
     this.renderer.setScissorTest(false);
   }
@@ -385,9 +435,9 @@ export class RenderScene {
   public resetView(): void {
     this.orbitYaw = 0;
     this.orbitPitch = 0;
-    this.orbitRadius = 3.5;
     this.orbitTarget.copy(this.defaultTarget);
     this.updateCameraOrbit();
+    this.viewDistanceChangeHandler?.(this.orbitRadius);
   }
 
   private onXRSessionStart(): void {
@@ -407,9 +457,7 @@ export class RenderScene {
     if (!this.mesh) return;
     const target = inXR ? this.xrTarget : this.defaultTarget;
     this.orbitTarget.copy(target);
-    // Place mesh so its center is in front of the user in XR; keep y offset similar.
-    const yOffset = inXR ? this.vrYOffset : 0;
-    this.mesh.position.set(target.x, target.y + yOffset, target.z);
+    this.applyMeshPlacement(inXR);
     // Keep camera orbit radius modest so controllers start close to the content.
     if (inXR) {
       this.orbitRadius = 2.5;
@@ -514,9 +562,27 @@ export class RenderScene {
     });
     dom.addEventListener('wheel', (e) => {
       e.preventDefault();
-      this.orbitRadius = THREE.MathUtils.clamp(this.orbitRadius + e.deltaY * 0.002, 0.6, 10);
+      this.orbitRadius = this.clampViewDistance(this.orbitRadius + e.deltaY * 0.002);
       this.updateCameraOrbit();
+      this.viewDistanceChangeHandler?.(this.orbitRadius);
     }, { passive: false });
+  }
+
+  private clampViewDistance(distance: number): number {
+    return THREE.MathUtils.clamp(distance, 0.2, 10);
+  }
+
+  private clampModelZOffset(offset: number): number {
+    return THREE.MathUtils.clamp(offset, -5, 5);
+  }
+
+  private applyMeshPlacement(inXR: boolean): void {
+    if (!this.mesh) return;
+    if (inXR) {
+      this.mesh.position.set(this.xrTarget.x, this.xrTarget.y + this.vrYOffset, this.xrTarget.z);
+      return;
+    }
+    this.mesh.position.set(0, this.currentControls.yOffset, this.modelZOffset);
   }
 
   async startLookingGlass(): Promise<void> {

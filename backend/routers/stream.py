@@ -12,7 +12,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 
 from backend.models.depth_model import get_depth_model
 from backend.utils.packets import pack_depth_payload
-from backend.utils.depth_ops import downsample_depth
+from backend.video.io import EndOfStreamError
 from backend.video.session import DepthFrame, get_session_manager, SessionManager
 from backend.config import get_settings
 from backend.utils.queues import DroppingQueue
@@ -49,6 +49,14 @@ async def depth_stream(
     active_tasks = set()
     
     stats = StatisticsCollector()
+
+    async def cancel_pending(*tasks: asyncio.Task) -> None:
+        pending = [task for task in tasks if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            with suppress(Exception):
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def receiver() -> None:
         try:
@@ -122,7 +130,7 @@ async def depth_stream(
             
             timings["decode_s"] = decode_s
             # print(f"[Backend] Processing: {time_ms}ms. QueueWait: {timings['queue_wait_s']:.3f}s. Decode: {timings['decode_s']:.3f}s")
-        except StopIteration:
+        except EndOfStreamError:
             # EOF
             return None, timings
         except Exception as e:
@@ -227,9 +235,9 @@ async def depth_stream(
                 get_task = asyncio.create_task(request_queue.get())
                 stop_task = asyncio.create_task(stop.wait())
                 done, _ = await asyncio.wait([get_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
+                await cancel_pending(get_task, stop_task)
                 
                 if stop_task in done:
-                    get_task.cancel()
                     break
                 
                 request = get_task.result()
@@ -275,9 +283,9 @@ async def depth_stream(
                 get_task = asyncio.create_task(send_queue.get())
                 stop_task = asyncio.create_task(stop.wait())
                 done, _ = await asyncio.wait([get_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
+                await cancel_pending(get_task, stop_task)
                 
                 if stop_task in done:
-                    get_task.cancel()
                     break
                     
                 task = get_task.result()
@@ -311,6 +319,7 @@ async def depth_stream(
                                 int(timings.get("inflight_used", 0)),
                             )
                     except Exception:
+                        stop.set()
                         break # Socket closed
             except asyncio.CancelledError:
                 break

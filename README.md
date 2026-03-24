@@ -23,8 +23,9 @@ VideoDepthViewer3D is a high-performance streaming MP4 depth viewer. It decodes 
   - **WebSocket stream:** Depth maps are quantized (uint16), optionally downsampled, and sent with a binary header.
 - **Frontend (Vite + Three.js/WebXR)**
   - **DepthBuffer:** Manages sync, handles jitter, and re-requests missing frames.
-  - **Mesh generation:** Grid mesh displaced in the vertex shader by the depth map.
-  - **WebXR:** RawXR path renders the same mesh to both eyes; Three.js XR is disabled (experimental VR).
+  - **Mesh generation:** Grid mesh can be reconstructed either as a classic relief mesh or with pinhole-style reprojection. The default is now **pinhole**.
+  - **Shared viewer controls:** The same projection/depth controls drive both the normal Three.js path and the RawXR mesh path.
+  - **WebXR:** RawXR path renders the same reconstructed mesh to both eyes; Three.js XR is disabled (experimental VR).
 
 ### Setup & Run
 1. **Install dependencies (uv):**
@@ -62,8 +63,14 @@ VideoDepthViewer3D is a high-performance streaming MP4 depth viewer. It decodes 
 
 ### Display Modes
 - **Normal (PC 2D/3D):** Three.js draws video + depth mesh on the page.
-- **SBS Stereo (0DOF):** Side-by-side split for passive stereo (no head tracking).
+- **SBS Stereo (0DOF):** Side-by-side split for passive stereo (no head tracking). You can optionally swap left/right eyes with the `Swap L/R` checkbox.
 - **VR (RawXR):** Starts WebXR and renders the depth mesh to both eyes via the RawXR pipeline (experimental).
+
+### Viewer Controls
+- **Projection:** `pinhole` is the default. `relief` remains available for comparison.
+- **View FOV Y / Source FOV Y:** Separate the display camera FOV from the source reprojection FOV.
+- **Camera Dist / Model Z:** Experimental 2D/SBS-only placement controls for moving the display camera or the reconstructed mesh without changing backend throughput.
+- **Z Scale / Z Bias / Z Gamma / Z Max Clip / Plane Scale / Y Offset:** Depth shaping and placement controls shared by Three.js and RawXR.
 
 ### Configuration
 You can tune performance via backend environment variables and frontend URL parameters.
@@ -117,8 +124,9 @@ VideoDepthViewer3D は、MP4 動画をリアルタイムに深度推定して 3D
   - **WebSocket ストリーム:** 深度マップを uint16 量子化し、必要に応じてダウンサンプルしてバイナリヘッダー付きで送信。
 - **フロントエンド (Vite + Three.js/WebXR)**
   - **DepthBuffer:** 同期管理と欠落フレーム再要求で滑らかな再生を維持。
-  - **メッシュ生成:** グリッドメッシュを深度マップで頂点変位。
-  - **WebXR:** RawXR (WebGL2) で両目に同じメッシュを描画。同期ズレや黒画面問題を解消。
+  - **メッシュ生成:** グリッドメッシュを、従来の relief 方式または pinhole 方式で再構成できます。現在のデフォルトは **pinhole** です。
+  - **共通ビューア設定:** 通常の Three.js 描画と RawXR のメッシュ描画は同じ投影/深度コントロールを共有します。
+  - **WebXR:** RawXR (WebGL2) で両目に同じ再構成メッシュを描画。同期ズレや黒画面問題を解消。
 
 ### セットアップと実行
 1. **依存関係のインストール (uv):**
@@ -155,8 +163,14 @@ VideoDepthViewer3D は、MP4 動画をリアルタイムに深度推定して 3D
 
 ### 表示モード
 - **通常 (PC 2D/3D):** Three.js が動画と深度メッシュを描画。
-- **SBS Stereo (0DOF):** サイドバイサイドのパッシブ立体視（頭トラッキングなし）。
+- **SBS Stereo (0DOF):** サイドバイサイドのパッシブ立体視（頭トラッキングなし）。`Swap L/R` チェックで左右の目を入れ替えられます。
 - **VR (RawXR):** WebXR を開始し、最適化されたパイプラインで描画。コントローラーで視点操作（オービット、パン、ズーム）が可能。（実験的段階）
+
+### ビューア設定
+- **Projection:** デフォルトは `pinhole` です。比較用に `relief` も残しています。
+- **View FOV Y / Source FOV Y:** 表示カメラの FOV と、再投影に使う source 側の FOV を分離しています。
+- **Camera Dist / Model Z:** 2D/SBS 専用の実験的な配置コントロールです。バックエンドの処理負荷を変えずに、表示カメラや再構成メッシュの前後位置を調整できます。
+- **Z Scale / Z Bias / Z Gamma / Z Max Clip / Plane Scale / Y Offset:** Three.js と RawXR で共通の深度整形・配置パラメータです。
 
 ### 設定一覧
 環境変数（バックエンド）と URL パラメータ（フロントエンド）でパフォーマンスを調整できます。

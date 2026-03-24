@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import os
-os.environ["DA3_LOG_LEVEL"] = "WARN"
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+from backend.config import get_settings
 from backend.routers import session as session_router
 from backend.routers import stream as stream_router
-from backend.config import get_settings
 from backend.video.session import get_session_manager
+
+os.environ["DA3_LOG_LEVEL"] = "WARN"
 
 
 def create_app() -> FastAPI:
@@ -37,9 +39,6 @@ def create_app() -> FastAPI:
         await get_session_manager().clear_cache()
 
     return app
-
-
-from pydantic import BaseModel
 
 class LogMessage(BaseModel):
     message: str

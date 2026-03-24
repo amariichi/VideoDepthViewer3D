@@ -14,7 +14,7 @@ import logging
 from fastapi import UploadFile
 
 from backend.config import get_settings
-from backend.video.io import DecoderPool, FrameDecoder, VideoMetadata
+from backend.video.io import DecoderPool, VideoMetadata
 
 
 @dataclass

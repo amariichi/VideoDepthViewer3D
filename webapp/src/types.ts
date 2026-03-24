@@ -42,9 +42,13 @@ export interface PerfSettings {
   autoLead: boolean;
 }
 
+export type ProjectionMode = 'relief' | 'pinhole';
+
 export interface ViewerControls {
+  projectionMode: ProjectionMode;
   targetTriangles: number;
   fovY: number;
+  sourceFovY: number;
   zScale: number;
   zBias: number;
   zGamma: number;
