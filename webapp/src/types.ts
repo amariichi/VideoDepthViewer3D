@@ -48,10 +48,12 @@ export interface ViewerControls {
   projectionMode: ProjectionMode;
   targetTriangles: number;
   fovY: number;
+  sourceFovY: number;
   zScale: number;
   zBias: number;
   zGamma: number;
   zMaxClip: number;
+  edgeDiscardThreshold: number;
   planeScale: number;
   yOffset: number;
 }

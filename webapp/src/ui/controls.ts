@@ -50,8 +50,11 @@ export class ControlPanel {
     folder.add(store.viewerControls, 'targetTriangles', 50_000, 300_000, 10_000).name('Target tris').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ targetTriangles: value });
     });
-    folder.add(store.viewerControls, 'fovY', 30, 90, 1).name('FOV Y').onChange((value: number) => {
+    folder.add(store.viewerControls, 'fovY', 30, 90, 1).name('View FOV Y').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ fovY: value });
+    });
+    folder.add(store.viewerControls, 'sourceFovY', 30, 100, 1).name('Source FOV Y').onChange((value: number) => {
+      usePlayerStore.getState().updateControls({ sourceFovY: value });
     });
     folder.add(store.viewerControls, 'zScale', 0.5, 5.0, 0.05).name('Z Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zScale: value });
@@ -64,6 +67,9 @@ export class ControlPanel {
     });
     folder.add(store.viewerControls, 'zMaxClip', 5, 100, 1).name('Z Max Clip').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zMaxClip: value });
+    });
+    folder.add(store.viewerControls, 'edgeDiscardThreshold', 0.0, 0.6, 0.01).name('Edge Cut').onChange((value: number) => {
+      usePlayerStore.getState().updateControls({ edgeDiscardThreshold: value });
     });
     folder.add(store.viewerControls, 'planeScale', 0.5, 3.5, 0.1).name('Plane Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ planeScale: value });

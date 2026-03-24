@@ -3,7 +3,7 @@ import * as THREE from 'three';
 // VRButton unused (RawXRに統一)
 import type { DepthFrame, ViewerControls } from '../types';
 import { createGridGeometry } from './mesh';
-import { getProjectionMix, getTanHalfFovY } from './projection';
+import { getEffectiveEdgeDiscardThreshold, getProjectionMix, getTanHalfSourceFovY } from './projection';
 import { fragmentShader, vertexShader } from './shaders';
 import { perfStats } from '../utils/perfStats';
 
@@ -231,7 +231,8 @@ export class RenderScene {
       uniforms.zMaxClip.value = this.currentControls.zMaxClip;
       uniforms.planeScale.value = this.currentControls.planeScale;
       uniforms.projectionMix.value = getProjectionMix(this.currentControls);
-      uniforms.tanHalfFovY.value = getTanHalfFovY(this.currentControls);
+      uniforms.tanHalfSourceFovY.value = getTanHalfSourceFovY(this.currentControls);
+      uniforms.edgeDiscardThreshold.value = getEffectiveEdgeDiscardThreshold(this.currentControls);
       this.mesh.position.y = this.currentControls.yOffset;
     }
   }
@@ -265,6 +266,7 @@ export class RenderScene {
       this.mesh.material.uniforms.depthTexture.value = this.depthTexture;
     }
     const uniforms = this.mesh.material.uniforms;
+    uniforms.depthSize.value.set(frame.width, frame.height);
     uniforms.aspect.value = frame.width / frame.height;
     uniforms.zScale.value = controls.zScale;
     uniforms.zBias.value = controls.zBias;
@@ -272,7 +274,8 @@ export class RenderScene {
     uniforms.zMaxClip.value = controls.zMaxClip;
     uniforms.planeScale.value = controls.planeScale;
     uniforms.projectionMix.value = getProjectionMix(controls);
-    uniforms.tanHalfFovY.value = getTanHalfFovY(controls);
+    uniforms.tanHalfSourceFovY.value = getTanHalfSourceFovY(controls);
+    uniforms.edgeDiscardThreshold.value = getEffectiveEdgeDiscardThreshold(controls);
     const yOffset = this.renderer.xr.isPresenting ? controls.yOffset + this.vrYOffset : controls.yOffset;
     this.mesh.position.y = yOffset;
     perfStats.add('scene.updateDepth', performance.now() - start);
@@ -302,7 +305,8 @@ export class RenderScene {
         zMaxClip: { value: controls.zMaxClip },
         planeScale: { value: controls.planeScale },
         projectionMix: { value: getProjectionMix(controls) },
-        tanHalfFovY: { value: getTanHalfFovY(controls) },
+        tanHalfSourceFovY: { value: getTanHalfSourceFovY(controls) },
+        edgeDiscardThreshold: { value: getEffectiveEdgeDiscardThreshold(controls) },
       },
       vertexShader,
       fragmentShader,
