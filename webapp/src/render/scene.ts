@@ -47,6 +47,7 @@ export class RenderScene {
   ];
   private rawXRViewport = new THREE.Vector4();
   private manualPrevXREnabled: boolean | null = null;
+  private viewDistanceChangeHandler: ((distance: number) => void) | null = null;
 
   constructor(
     container: HTMLElement,
@@ -94,6 +95,7 @@ export class RenderScene {
     const point = new THREE.PointLight(0xffffff, 0.8);
     point.position.set(2, 3, 2);
     this.scene.add(point);
+    this.orbitRadius = this.clampViewDistance(this.orbitRadius);
     this.camera = new THREE.PerspectiveCamera(initialControls.fovY, this.aspectRatio(), 0.01, 1000);
     this.camera.position.set(0, 1.4, this.orbitRadius);
     this.camera.lookAt(this.orbitTarget);
@@ -164,6 +166,22 @@ export class RenderScene {
     this.sbsEnabled = enabled;
     // Recompute camera aspect immediately to avoid squashing on first frame
     this.handleResize();
+  }
+
+  public getViewDistance(): number {
+    return this.orbitRadius;
+  }
+
+  public setViewDistance(distance: number): void {
+    this.orbitRadius = this.clampViewDistance(distance);
+    if (!this.renderer.xr.isPresenting) {
+      this.updateCameraOrbit();
+    }
+    this.viewDistanceChangeHandler?.(this.orbitRadius);
+  }
+
+  public setViewDistanceChangeHandler(handler: (distance: number) => void): void {
+    this.viewDistanceChangeHandler = handler;
   }
 
   public isSbsEnabled(): boolean {
@@ -391,9 +409,9 @@ export class RenderScene {
   public resetView(): void {
     this.orbitYaw = 0;
     this.orbitPitch = 0;
-    this.orbitRadius = 3.5;
     this.orbitTarget.copy(this.defaultTarget);
     this.updateCameraOrbit();
+    this.viewDistanceChangeHandler?.(this.orbitRadius);
   }
 
   private onXRSessionStart(): void {
@@ -520,9 +538,14 @@ export class RenderScene {
     });
     dom.addEventListener('wheel', (e) => {
       e.preventDefault();
-      this.orbitRadius = THREE.MathUtils.clamp(this.orbitRadius + e.deltaY * 0.002, 0.6, 10);
+      this.orbitRadius = this.clampViewDistance(this.orbitRadius + e.deltaY * 0.002);
       this.updateCameraOrbit();
+      this.viewDistanceChangeHandler?.(this.orbitRadius);
     }, { passive: false });
+  }
+
+  private clampViewDistance(distance: number): number {
+    return THREE.MathUtils.clamp(distance, 0.6, 10);
   }
 
   async startLookingGlass(): Promise<void> {

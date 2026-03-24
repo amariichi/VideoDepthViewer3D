@@ -4,6 +4,8 @@ import { usePlayerStore } from '../state/playerStore';
 interface ControlCallbacks {
   onFileSelected: (file: File) => Promise<void>;
   getFrontendFps: () => number;
+  getViewDistance: () => number;
+  onViewDistanceChanged: (distance: number) => void;
 }
 
 interface ControlElements {
@@ -18,10 +20,13 @@ export class ControlPanel {
   private perfGui: GUI;
   private elements: ControlElements;
   private callbacks: ControlCallbacks;
+  private viewDistanceState = { cameraDistance: 3.5 };
+  private cameraDistanceController: ReturnType<GUI['add']> | null = null;
 
   constructor(elements: ControlElements, callbacks: ControlCallbacks) {
     this.elements = elements;
     this.callbacks = callbacks;
+    this.viewDistanceState.cameraDistance = this.callbacks.getViewDistance();
     this.depthGui = new GUI({ container: elements.depthGui, title: 'Depth Controls' });
     this.perfGui = new GUI({ container: elements.perfGui, title: 'Performance' });
     this.mountFileInput();
@@ -55,6 +60,9 @@ export class ControlPanel {
     });
     folder.add(store.viewerControls, 'sourceFovY', 30, 100, 1).name('Source FOV Y').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ sourceFovY: value });
+    });
+    this.cameraDistanceController = folder.add(this.viewDistanceState, 'cameraDistance', 0.6, 10.0, 0.05).name('Camera Dist').onChange((value: number) => {
+      this.callbacks.onViewDistanceChanged(value);
     });
     folder.add(store.viewerControls, 'zScale', 0.5, 5.0, 0.05).name('Z Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zScale: value });
@@ -147,5 +155,10 @@ export class ControlPanel {
 
   updateStatus(message: string): void {
     this.elements.status.textContent = message;
+  }
+
+  setViewDistance(distance: number): void {
+    this.viewDistanceState.cameraDistance = distance;
+    this.cameraDistanceController?.updateDisplay();
   }
 }

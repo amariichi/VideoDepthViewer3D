@@ -51,8 +51,13 @@ export class VideoDepthApp {
       {
         onFileSelected: async (file) => this.handleFileSelected(file),
         getFrontendFps: () => this.getFrontendFps(),
+        getViewDistance: () => this.renderScene.getViewDistance(),
+        onViewDistanceChanged: (distance) => this.renderScene.setViewDistance(distance),
       }
     );
+    this.renderScene.setViewDistanceChangeHandler((distance) => {
+      this.controlPanel.setViewDistance(distance);
+    });
 
     // Manual Open Video button handler to ensure video is paused BEFORE file dialog opens
     const openBtn = root.querySelector('#btn-open-file');
