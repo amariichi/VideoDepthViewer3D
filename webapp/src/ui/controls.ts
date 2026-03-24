@@ -61,7 +61,7 @@ export class ControlPanel {
     folder.add(store.viewerControls, 'sourceFovY', 30, 100, 1).name('Source FOV Y').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ sourceFovY: value });
     });
-    this.cameraDistanceController = folder.add(this.viewDistanceState, 'cameraDistance', 0.6, 10.0, 0.05).name('Camera Dist').onChange((value: number) => {
+    this.cameraDistanceController = folder.add(this.viewDistanceState, 'cameraDistance', 0.2, 10.0, 0.05).name('Camera Dist').onChange((value: number) => {
       this.callbacks.onViewDistanceChanged(value);
     });
     folder.add(store.viewerControls, 'zScale', 0.5, 5.0, 0.05).name('Z Scale').onChange((value: number) => {

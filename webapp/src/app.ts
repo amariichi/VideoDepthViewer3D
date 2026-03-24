@@ -92,8 +92,9 @@ export class VideoDepthApp {
     const rawVrBtn = document.getElementById('btn-vr') as HTMLButtonElement;
     const helpCheckbox = document.getElementById('chk-hints') as HTMLInputElement;
     const sbsBtn = document.getElementById('btn-sbs') as HTMLButtonElement;
+    const sbsSwapCheckbox = document.getElementById('chk-sbs-swap') as HTMLInputElement;
 
-    if (!rawVrBtn || !helpCheckbox || !sbsBtn) {
+    if (!rawVrBtn || !helpCheckbox || !sbsBtn || !sbsSwapCheckbox) {
       console.warn('XR buttons not found in DOM');
       return;
     }
@@ -160,6 +161,13 @@ export class VideoDepthApp {
       }
     });
     sbsBtn.dataset.enabled = 'false';
+    sbsSwapCheckbox.checked = false;
+    sbsSwapCheckbox.addEventListener('change', () => {
+      this.renderScene.setSbsSwapEyes(sbsSwapCheckbox.checked);
+      if (this.renderScene.isSbsEnabled()) {
+        this.controlPanel.updateStatus(sbsSwapCheckbox.checked ? 'SBS swap ON' : 'SBS swap OFF');
+      }
+    });
 
     // フルスクリーン解除時はSBSもOFFに戻す
     document.addEventListener('fullscreenchange', () => {

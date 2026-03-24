@@ -31,6 +31,7 @@ export class RenderScene {
   private readonly xrTarget = new THREE.Vector3(0, 0.6, -1.0);
   private readonly ipd = 0.064; // meters
   private sbsEnabled = false;
+  private sbsSwapEyes = false;
   private vrYOffset = -1.4; // lower content in VR so中心が目線に来る
   private instructionBillboard: THREE.Sprite | null = null;
   private instructionsVisible = true;
@@ -166,6 +167,10 @@ export class RenderScene {
     this.sbsEnabled = enabled;
     // Recompute camera aspect immediately to avoid squashing on first frame
     this.handleResize();
+  }
+
+  public setSbsSwapEyes(enabled: boolean): void {
+    this.sbsSwapEyes = enabled;
   }
 
   public getViewDistance(): number {
@@ -389,15 +394,18 @@ export class RenderScene {
 
     this.renderer.setScissorTest(true);
 
+    const leftViewportCam = this.sbsSwapEyes ? this.sbsRightCam : this.sbsLeftCam;
+    const rightViewportCam = this.sbsSwapEyes ? this.sbsLeftCam : this.sbsRightCam;
+
     // left
     this.renderer.setViewport(0, 0, halfW, h);
     this.renderer.setScissor(0, 0, halfW, h);
-    this.renderer.render(this.scene, this.sbsLeftCam);
+    this.renderer.render(this.scene, leftViewportCam);
 
     // right
     this.renderer.setViewport(halfW, 0, halfW, h);
     this.renderer.setScissor(halfW, 0, halfW, h);
-    this.renderer.render(this.scene, this.sbsRightCam);
+    this.renderer.render(this.scene, rightViewportCam);
 
     this.renderer.setScissorTest(false);
   }
@@ -545,7 +553,7 @@ export class RenderScene {
   }
 
   private clampViewDistance(distance: number): number {
-    return THREE.MathUtils.clamp(distance, 0.6, 10);
+    return THREE.MathUtils.clamp(distance, 0.2, 10);
   }
 
   async startLookingGlass(): Promise<void> {
