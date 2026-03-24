@@ -672,7 +672,7 @@ export class RawXRTest {
 
   private getControls(): ViewerControls {
     const fallback: ViewerControls = {
-      projectionMode: 'relief',
+      projectionMode: 'pinhole',
       targetTriangles: 8000,
       fovY: 60,
       sourceFovY: 60,

@@ -18,7 +18,7 @@ export interface PlayerState {
 }
 
 const defaultControls: ViewerControls = {
-  projectionMode: 'relief',
+  projectionMode: 'pinhole',
   targetTriangles: 200_000,
   fovY: 50,
   sourceFovY: 50,
