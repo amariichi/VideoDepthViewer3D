@@ -12,7 +12,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 
 from backend.models.depth_model import get_depth_model
 from backend.utils.packets import pack_depth_payload
-from backend.utils.depth_ops import downsample_depth
 from backend.video.io import EndOfStreamError
 from backend.video.session import DepthFrame, get_session_manager, SessionManager
 from backend.config import get_settings
