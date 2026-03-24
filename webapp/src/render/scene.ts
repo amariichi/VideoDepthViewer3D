@@ -3,6 +3,7 @@ import * as THREE from 'three';
 // VRButton unused (RawXRに統一)
 import type { DepthFrame, ViewerControls } from '../types';
 import { createGridGeometry } from './mesh';
+import { getProjectionMix, getTanHalfFovY } from './projection';
 import { fragmentShader, vertexShader } from './shaders';
 import { perfStats } from '../utils/perfStats';
 
@@ -229,6 +230,8 @@ export class RenderScene {
       uniforms.zGamma.value = this.currentControls.zGamma;
       uniforms.zMaxClip.value = this.currentControls.zMaxClip;
       uniforms.planeScale.value = this.currentControls.planeScale;
+      uniforms.projectionMix.value = getProjectionMix(this.currentControls);
+      uniforms.tanHalfFovY.value = getTanHalfFovY(this.currentControls);
       this.mesh.position.y = this.currentControls.yOffset;
     }
   }
@@ -268,6 +271,8 @@ export class RenderScene {
     uniforms.zGamma.value = controls.zGamma;
     uniforms.zMaxClip.value = controls.zMaxClip;
     uniforms.planeScale.value = controls.planeScale;
+    uniforms.projectionMix.value = getProjectionMix(controls);
+    uniforms.tanHalfFovY.value = getTanHalfFovY(controls);
     const yOffset = this.renderer.xr.isPresenting ? controls.yOffset + this.vrYOffset : controls.yOffset;
     this.mesh.position.y = yOffset;
     perfStats.add('scene.updateDepth', performance.now() - start);
@@ -296,6 +301,8 @@ export class RenderScene {
         zGamma: { value: controls.zGamma },
         zMaxClip: { value: controls.zMaxClip },
         planeScale: { value: controls.planeScale },
+        projectionMix: { value: getProjectionMix(controls) },
+        tanHalfFovY: { value: getTanHalfFovY(controls) },
       },
       vertexShader,
       fragmentShader,

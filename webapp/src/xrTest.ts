@@ -3,6 +3,7 @@
 import * as THREE from 'three';
 import { drawThreeStereo } from './xrThreeBridge';
 import type { DepthFrame, ViewerControls } from './types';
+import { getProjectionMix, getTanHalfFovY } from './render/projection';
 import { DepthBuffer } from './utils/depthBuffer';
 
 type RawXRMode = 'quad' | 'mesh' | 'three';
@@ -25,6 +26,8 @@ interface MeshState {
     zGamma: WebGLUniformLocation | null;
     zMaxClip: WebGLUniformLocation | null;
     planeScale: WebGLUniformLocation | null;
+    projectionMix: WebGLUniformLocation | null;
+    tanHalfFovY: WebGLUniformLocation | null;
   };
 }
 
@@ -568,6 +571,8 @@ export class RawXRTest {
         gl.uniform1f(s.mesh.uniforms.zGamma, controls.zGamma);
         gl.uniform1f(s.mesh.uniforms.zMaxClip, controls.zMaxClip);
         gl.uniform1f(s.mesh.uniforms.planeScale, controls.planeScale);
+        gl.uniform1f(s.mesh.uniforms.projectionMix, getProjectionMix(controls));
+        gl.uniform1f(s.mesh.uniforms.tanHalfFovY, getTanHalfFovY(controls));
 
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, s.mesh.depthTex);
@@ -667,6 +672,7 @@ export class RawXRTest {
 
   private getControls(): ViewerControls {
     const fallback: ViewerControls = {
+      projectionMode: 'relief',
       targetTriangles: 8000,
       fovY: 60,
       zScale: 1.0,
@@ -703,6 +709,8 @@ export class RawXRTest {
         uniform float uZGamma;\n
         uniform float uZMaxClip;\n
         uniform float uPlaneScale;\n
+        uniform float uProjectionMix;\n
+        uniform float uTanHalfFovY;\n
         out vec2 vUv;\n
         void main(){\n
           // Keep video座標は左→右、上→下。サンプルは上下反転のみ。
@@ -715,9 +723,13 @@ export class RawXRTest {
           // the mesh looks flat.
           float zDepth = clamp(depth * uZScale, 0.0, uZMaxClip);
           float z = zDepth + uZBias;
-          // 右手系: +X が右。元は符号が逆で背面を向いていた。\n
-          float x = (aUv.x - 0.5) * uAspect * uPlaneScale;\n
-          float y = (0.5 - aUv.y) * uPlaneScale;\n
+          float reliefX = (aUv.x - 0.5) * uAspect * uPlaneScale;\n
+          float reliefY = (0.5 - aUv.y) * uPlaneScale;\n
+          float pinholeSpread = (2.0 * uTanHalfFovY) * (0.5 * uPlaneScale);\n
+          float pinholeX = (aUv.x - 0.5) * uAspect * pinholeSpread * z;\n
+          float pinholeY = (0.5 - aUv.y) * pinholeSpread * z;\n
+          float x = mix(reliefX, pinholeX, uProjectionMix);\n
+          float y = mix(reliefY, pinholeY, uProjectionMix);\n
           vec4 local = vec4(x, y, -z, 1.0);\n
           gl_Position = uViewProj * uModel * local;\n
         }`;
@@ -739,6 +751,8 @@ export class RawXRTest {
         zGamma: gl.getUniformLocation(prog, 'uZGamma'),
         zMaxClip: gl.getUniformLocation(prog, 'uZMaxClip'),
         planeScale: gl.getUniformLocation(prog, 'uPlaneScale'),
+        projectionMix: gl.getUniformLocation(prog, 'uProjectionMix'),
+        tanHalfFovY: gl.getUniformLocation(prog, 'uTanHalfFovY'),
       };
       gl.useProgram(prog);
       const depthLoc = gl.getUniformLocation(prog, 'uDepthTex');

@@ -18,6 +18,7 @@ export interface PlayerState {
 }
 
 const defaultControls: ViewerControls = {
+  projectionMode: 'relief',
   targetTriangles: 200_000,
   fovY: 50,
   zScale: 1.0,

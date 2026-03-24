@@ -20,6 +20,7 @@ export class VideoDepthApp {
   private depthBuffer = new DepthBuffer();
   private lastAspect = 0;
   private rawXR: RawXRTest | null = null;
+  private suppressSeekRefresh = false;
 
   constructor(root: HTMLElement) {
     // ... (existing constructor code)
@@ -31,6 +32,8 @@ export class VideoDepthApp {
     video.preload = 'metadata';
     root.querySelector('#video-container')?.appendChild(video);
     this.videoEl = video;
+    this.videoEl.addEventListener('ended', () => this.handleVideoEnded());
+    this.videoEl.addEventListener('seeked', () => this.handleVideoSeeked());
     usePlayerStore.getState().setVideo(video);
 
     const canvasContainer = root.querySelector('#canvas-container') as HTMLElement;
@@ -188,7 +191,6 @@ export class VideoDepthApp {
       this.startRenderLoop(); // Restart render loop
     };
     this.videoEl.addEventListener('loadeddata', onLoaded);
-    this.videoEl.addEventListener('ended', () => this.handleVideoEnded());
     this.videoEl.play();
   }
 
@@ -396,6 +398,7 @@ export class VideoDepthApp {
   private handleVideoEnded(): void {
     // Reset playback position and depth buffers so replay works
     this.depthBuffer.clear();
+    this.suppressSeekRefresh = true;
     this.videoEl.currentTime = 0;
     // Refresh depth stream connection to drop pending/inflight safely
     if (this.depthClient) {
@@ -403,6 +406,18 @@ export class VideoDepthApp {
       this.depthClient.connect();
     }
     // Let the user press play again; depth polling loop will pick up from t=0
+  }
+
+  private handleVideoSeeked(): void {
+    if (this.suppressSeekRefresh) {
+      this.suppressSeekRefresh = false;
+      return;
+    }
+    if (!this.depthClient || !this.currentSession) return;
+    // Drop stale future requests and frames after explicit timeline jumps.
+    this.depthBuffer.clear();
+    this.depthClient.close();
+    this.depthClient.connect();
   }
 
   private healthIntervalId: number | null = null;

@@ -41,6 +41,12 @@ export class ControlPanel {
   private mountSliders(): void {
     const store = usePlayerStore.getState();
     const folder = this.depthGui; // no extra nesting
+    folder
+      .add(store.viewerControls, 'projectionMode', { Relief: 'relief', Pinhole: 'pinhole' })
+      .name('Projection')
+      .onChange((value: 'relief' | 'pinhole') => {
+        usePlayerStore.getState().updateControls({ projectionMode: value });
+      });
     folder.add(store.viewerControls, 'targetTriangles', 50_000, 300_000, 10_000).name('Target tris').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ targetTriangles: value });
     });

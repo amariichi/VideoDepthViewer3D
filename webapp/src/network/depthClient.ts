@@ -107,8 +107,18 @@ export class DepthClient {
       this.socket.close();
       this.socket = null;
     }
+    this.resetStreamState();
+  }
+
+  resetStreamState(): void {
     this.pending = [];
     this.inflight = 0;
+    this.droppedFrames = 0;
+    this.lastTimestampMs = -1;
+    this.requestTimes.clear();
+    this.rtt = 0;
+    this.lastArrival = 0;
+    this.arrivalDeltas = [];
   }
 
   requestDepth(timeMs: number): void {

@@ -14,6 +14,23 @@ import threading
 from backend.utils.frame_info import FrameInfo, frame_info_from_av
 
 
+class EndOfStreamError(Exception):
+    """Raised when the decoder reaches EOF for a requested timestamp."""
+
+
+def _is_av_eof(exc: Exception) -> bool:
+    av_error_mod = getattr(av, "error", None)
+    eof_types = tuple(
+        cls
+        for cls in (
+            getattr(av, "EOFError", None),
+            getattr(av_error_mod, "EOFError", None),
+        )
+        if isinstance(cls, type)
+    )
+    return isinstance(exc, eof_types) if eof_types else False
+
+
 @dataclass(frozen=True)
 class VideoMetadata:
     width: int
@@ -115,7 +132,12 @@ class FrameDecoder:
                 frame = next(self._frame_iter)
             except StopIteration as exc:  # pragma: no cover - EOF
                 self._frame_iter = None
-                raise StopIteration from exc
+                raise EndOfStreamError from exc
+            except Exception as exc:  # pragma: no cover - decoder EOF varies by PyAV build
+                if _is_av_eof(exc):
+                    self._frame_iter = None
+                    raise EndOfStreamError from exc
+                raise
             info = frame_info_from_av(frame)
             frames_examined += 1
             actual_time = info.time_ms if info.time_ms >= 0 else time_ms
