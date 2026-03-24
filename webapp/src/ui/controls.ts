@@ -68,9 +68,6 @@ export class ControlPanel {
     folder.add(store.viewerControls, 'zMaxClip', 5, 100, 1).name('Z Max Clip').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zMaxClip: value });
     });
-    folder.add(store.viewerControls, 'edgeDiscardThreshold', 0.0, 0.6, 0.01).name('Edge Cut').onChange((value: number) => {
-      usePlayerStore.getState().updateControls({ edgeDiscardThreshold: value });
-    });
     folder.add(store.viewerControls, 'planeScale', 0.5, 3.5, 0.1).name('Plane Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ planeScale: value });
     });

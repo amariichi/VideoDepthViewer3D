@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import { drawThreeStereo } from './xrThreeBridge';
 import type { DepthFrame, ViewerControls } from './types';
-import { getEffectiveEdgeDiscardThreshold, getProjectionMix, getTanHalfSourceFovY } from './render/projection';
+import { getProjectionMix, getTanHalfSourceFovY } from './render/projection';
 import { DepthBuffer } from './utils/depthBuffer';
 
 type RawXRMode = 'quad' | 'mesh' | 'three';
@@ -20,7 +20,6 @@ interface MeshState {
   uniforms: {
     viewProj: WebGLUniformLocation | null;
     model: WebGLUniformLocation | null;
-    depthSize: WebGLUniformLocation | null;
     aspect: WebGLUniformLocation | null;
     zScale: WebGLUniformLocation | null;
     zBias: WebGLUniformLocation | null;
@@ -29,7 +28,6 @@ interface MeshState {
     planeScale: WebGLUniformLocation | null;
     projectionMix: WebGLUniformLocation | null;
     tanHalfSourceFovY: WebGLUniformLocation | null;
-    edgeDiscardThreshold: WebGLUniformLocation | null;
   };
 }
 
@@ -567,7 +565,6 @@ export class RawXRTest {
         gl.useProgram(s.mesh.prog);
         gl.uniformMatrix4fv(s.mesh.uniforms.viewProj, false, viewProj.elements as unknown as Float32List);
         gl.uniformMatrix4fv(s.mesh.uniforms.model, false, model.elements as unknown as Float32List);
-        gl.uniform2f(s.mesh.uniforms.depthSize, depth.width, depth.height);
         gl.uniform1f(s.mesh.uniforms.aspect, depth.width / depth.height);
         gl.uniform1f(s.mesh.uniforms.zScale, controls.zScale);
         gl.uniform1f(s.mesh.uniforms.zBias, controls.zBias);
@@ -576,7 +573,6 @@ export class RawXRTest {
         gl.uniform1f(s.mesh.uniforms.planeScale, controls.planeScale);
         gl.uniform1f(s.mesh.uniforms.projectionMix, getProjectionMix(controls));
         gl.uniform1f(s.mesh.uniforms.tanHalfSourceFovY, getTanHalfSourceFovY(controls));
-        gl.uniform1f(s.mesh.uniforms.edgeDiscardThreshold, getEffectiveEdgeDiscardThreshold(controls));
 
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, s.mesh.depthTex);
@@ -684,7 +680,6 @@ export class RawXRTest {
       zBias: 0.0,
       zGamma: 1.0,
       zMaxClip: 5.0,
-      edgeDiscardThreshold: 0.2,
       planeScale: 1.0,
       yOffset: 0.0,
     };
@@ -709,7 +704,6 @@ export class RawXRTest {
         uniform mat4 uViewProj;\n
         uniform mat4 uModel;\n
         uniform sampler2D uDepthTex;\n
-        uniform vec2 uDepthSize;\n
         uniform float uAspect;\n
         uniform float uZScale;\n
         uniform float uZBias;\n
@@ -719,30 +713,15 @@ export class RawXRTest {
         uniform float uProjectionMix;\n
         uniform float uTanHalfSourceFovY;\n
         out vec2 vUv;\n
-        out float vEdgeMetric;\n
-        float shapeDepth(float rawDepth){\n
-          float depth = pow(max(rawDepth, 0.0), uZGamma);\n
-          return clamp(depth * uZScale, 0.0, uZMaxClip);\n
-        }\n
-        float relativeDiff(float a, float b){\n
-          return abs(a - b) / max(max(a, b), 1e-3);\n
-        }\n
         void main(){\n
           // Keep video座標は左→右、上→下。サンプルは上下反転のみ。
           vUv = vec2(aUv.x, 1.0 - aUv.y);
-          vec2 texel = vec2(1.0) / max(uDepthSize, vec2(1.0));\n
-          float zDepth = shapeDepth(texture(uDepthTex, vUv).r);\n
-          float leftDepth = shapeDepth(texture(uDepthTex, vUv + vec2(-texel.x, 0.0)).r);\n
-          float rightDepth = shapeDepth(texture(uDepthTex, vUv + vec2(texel.x, 0.0)).r);\n
-          float upDepth = shapeDepth(texture(uDepthTex, vUv + vec2(0.0, texel.y)).r);\n
-          float downDepth = shapeDepth(texture(uDepthTex, vUv + vec2(0.0, -texel.y)).r);\n
-          vEdgeMetric = max(\n
-            max(relativeDiff(zDepth, leftDepth), relativeDiff(zDepth, rightDepth)),\n
-            max(relativeDiff(zDepth, upDepth), relativeDiff(zDepth, downDepth))\n
-          );\n
+          float depth = texture(uDepthTex, vUv).r;\n
+          depth = pow(max(depth, 0.0), uZGamma);\n
           // Clip only the depth-derived component. Bias is a global offset and
           // should not be clamped, otherwise it saturates Z to a constant and
           // the mesh looks flat.
+          float zDepth = clamp(depth * uZScale, 0.0, uZMaxClip);\n
           float z = zDepth + uZBias;
           float reliefX = (aUv.x - 0.5) * uAspect * uPlaneScale;\n
           float reliefY = (0.5 - aUv.y) * uPlaneScale;\n
@@ -758,20 +737,14 @@ export class RawXRTest {
         precision highp float;\n
         in vec2 vUv;\n
         uniform sampler2D uVideoTex;\n
-        uniform float uEdgeDiscardThreshold;\n
-        in float vEdgeMetric;\n
         out vec4 fragColor;\n
         void main(){\n
-          if (uEdgeDiscardThreshold > 0.0 && vEdgeMetric > uEdgeDiscardThreshold) {\n
-            discard;\n
-          }\n
           fragColor = texture(uVideoTex, vUv);\n
         }`;
       prog = this.makeProgram(gl, vs, fs);
       uniforms = {
         viewProj: gl.getUniformLocation(prog, 'uViewProj'),
         model: gl.getUniformLocation(prog, 'uModel'),
-        depthSize: gl.getUniformLocation(prog, 'uDepthSize'),
         aspect: gl.getUniformLocation(prog, 'uAspect'),
         zScale: gl.getUniformLocation(prog, 'uZScale'),
         zBias: gl.getUniformLocation(prog, 'uZBias'),
@@ -780,7 +753,6 @@ export class RawXRTest {
         planeScale: gl.getUniformLocation(prog, 'uPlaneScale'),
         projectionMix: gl.getUniformLocation(prog, 'uProjectionMix'),
         tanHalfSourceFovY: gl.getUniformLocation(prog, 'uTanHalfSourceFovY'),
-        edgeDiscardThreshold: gl.getUniformLocation(prog, 'uEdgeDiscardThreshold'),
       };
       gl.useProgram(prog);
       const depthLoc = gl.getUniformLocation(prog, 'uDepthTex');

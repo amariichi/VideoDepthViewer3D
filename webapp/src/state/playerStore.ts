@@ -26,7 +26,6 @@ const defaultControls: ViewerControls = {
   zBias: 0.0,
   zGamma: 1.0,
   zMaxClip: 50,
-  edgeDiscardThreshold: 0.2,
   planeScale: 2.0,
   yOffset: 1.2,
 };

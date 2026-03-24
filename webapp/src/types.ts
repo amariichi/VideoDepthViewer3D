@@ -53,7 +53,6 @@ export interface ViewerControls {
   zBias: number;
   zGamma: number;
   zMaxClip: number;
-  edgeDiscardThreshold: number;
   planeScale: number;
   yOffset: number;
 }
