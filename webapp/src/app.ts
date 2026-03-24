@@ -53,10 +53,15 @@ export class VideoDepthApp {
         getFrontendFps: () => this.getFrontendFps(),
         getViewDistance: () => this.renderScene.getViewDistance(),
         onViewDistanceChanged: (distance) => this.renderScene.setViewDistance(distance),
+        getModelZOffset: () => this.renderScene.getModelZOffset(),
+        onModelZOffsetChanged: (offset) => this.renderScene.setModelZOffset(offset),
       }
     );
     this.renderScene.setViewDistanceChangeHandler((distance) => {
       this.controlPanel.setViewDistance(distance);
+    });
+    this.renderScene.setModelZOffsetChangeHandler((offset) => {
+      this.controlPanel.setModelZOffset(offset);
     });
 
     // Manual Open Video button handler to ensure video is paused BEFORE file dialog opens

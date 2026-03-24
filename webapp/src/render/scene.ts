@@ -49,6 +49,8 @@ export class RenderScene {
   private rawXRViewport = new THREE.Vector4();
   private manualPrevXREnabled: boolean | null = null;
   private viewDistanceChangeHandler: ((distance: number) => void) | null = null;
+  private modelZOffsetChangeHandler: ((offset: number) => void) | null = null;
+  private modelZOffset = 0;
 
   constructor(
     container: HTMLElement,
@@ -189,6 +191,27 @@ export class RenderScene {
     this.viewDistanceChangeHandler = handler;
   }
 
+  public getModelZOffset(): number {
+    return this.modelZOffset;
+  }
+
+  public setModelZOffset(offset: number): void {
+    const clamped = this.clampModelZOffset(offset);
+    const delta = clamped - this.modelZOffset;
+    this.modelZOffset = clamped;
+    this.defaultTarget.z += delta;
+    if (!this.renderer.xr.isPresenting) {
+      this.orbitTarget.z += delta;
+      this.applyMeshPlacement(false);
+      this.updateCameraOrbit();
+    }
+    this.modelZOffsetChangeHandler?.(this.modelZOffset);
+  }
+
+  public setModelZOffsetChangeHandler(handler: (offset: number) => void): void {
+    this.modelZOffsetChangeHandler = handler;
+  }
+
   public isSbsEnabled(): boolean {
     return this.sbsEnabled;
   }
@@ -255,7 +278,7 @@ export class RenderScene {
       uniforms.planeScale.value = this.currentControls.planeScale;
       uniforms.projectionMix.value = getProjectionMix(this.currentControls);
       uniforms.tanHalfSourceFovY.value = getTanHalfSourceFovY(this.currentControls);
-      this.mesh.position.y = this.currentControls.yOffset;
+      this.applyMeshPlacement(this.renderer.xr.isPresenting);
     }
   }
 
@@ -296,8 +319,7 @@ export class RenderScene {
     uniforms.planeScale.value = controls.planeScale;
     uniforms.projectionMix.value = getProjectionMix(controls);
     uniforms.tanHalfSourceFovY.value = getTanHalfSourceFovY(controls);
-    const yOffset = this.renderer.xr.isPresenting ? controls.yOffset + this.vrYOffset : controls.yOffset;
-    this.mesh.position.y = yOffset;
+    this.applyMeshPlacement(this.renderer.xr.isPresenting);
     perfStats.add('scene.updateDepth', performance.now() - start);
   }
 
@@ -330,7 +352,7 @@ export class RenderScene {
       fragmentShader,
     });
     this.mesh = new THREE.Mesh(geometry, material);
-    this.mesh.position.set(0, controls.yOffset, 0.0);
+    this.applyMeshPlacement(this.renderer.xr.isPresenting);
     this.scene.add(this.mesh);
     perfStats.add('scene.rebuildMesh', performance.now() - start);
     this.startLoop();
@@ -439,9 +461,7 @@ export class RenderScene {
     if (!this.mesh) return;
     const target = inXR ? this.xrTarget : this.defaultTarget;
     this.orbitTarget.copy(target);
-    // Place mesh so its center is in front of the user in XR; keep y offset similar.
-    const yOffset = inXR ? this.vrYOffset : 0;
-    this.mesh.position.set(target.x, target.y + yOffset, target.z);
+    this.applyMeshPlacement(inXR);
     // Keep camera orbit radius modest so controllers start close to the content.
     if (inXR) {
       this.orbitRadius = 2.5;
@@ -554,6 +574,19 @@ export class RenderScene {
 
   private clampViewDistance(distance: number): number {
     return THREE.MathUtils.clamp(distance, 0.2, 10);
+  }
+
+  private clampModelZOffset(offset: number): number {
+    return THREE.MathUtils.clamp(offset, -5, 5);
+  }
+
+  private applyMeshPlacement(inXR: boolean): void {
+    if (!this.mesh) return;
+    if (inXR) {
+      this.mesh.position.set(this.xrTarget.x, this.xrTarget.y + this.vrYOffset, this.xrTarget.z);
+      return;
+    }
+    this.mesh.position.set(0, this.currentControls.yOffset, this.modelZOffset);
   }
 
   async startLookingGlass(): Promise<void> {

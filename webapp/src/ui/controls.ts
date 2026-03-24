@@ -6,6 +6,8 @@ interface ControlCallbacks {
   getFrontendFps: () => number;
   getViewDistance: () => number;
   onViewDistanceChanged: (distance: number) => void;
+  getModelZOffset: () => number;
+  onModelZOffsetChanged: (offset: number) => void;
 }
 
 interface ControlElements {
@@ -21,12 +23,15 @@ export class ControlPanel {
   private elements: ControlElements;
   private callbacks: ControlCallbacks;
   private viewDistanceState = { cameraDistance: 3.5 };
+  private modelZState = { modelZOffset: 0 };
   private cameraDistanceController: ReturnType<GUI['add']> | null = null;
+  private modelZController: ReturnType<GUI['add']> | null = null;
 
   constructor(elements: ControlElements, callbacks: ControlCallbacks) {
     this.elements = elements;
     this.callbacks = callbacks;
     this.viewDistanceState.cameraDistance = this.callbacks.getViewDistance();
+    this.modelZState.modelZOffset = this.callbacks.getModelZOffset();
     this.depthGui = new GUI({ container: elements.depthGui, title: 'Depth Controls' });
     this.perfGui = new GUI({ container: elements.perfGui, title: 'Performance' });
     this.mountFileInput();
@@ -63,6 +68,9 @@ export class ControlPanel {
     });
     this.cameraDistanceController = folder.add(this.viewDistanceState, 'cameraDistance', 0.2, 10.0, 0.05).name('Camera Dist').onChange((value: number) => {
       this.callbacks.onViewDistanceChanged(value);
+    });
+    this.modelZController = folder.add(this.modelZState, 'modelZOffset', -5.0, 5.0, 0.05).name('Model Z').onChange((value: number) => {
+      this.callbacks.onModelZOffsetChanged(value);
     });
     folder.add(store.viewerControls, 'zScale', 0.5, 5.0, 0.05).name('Z Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zScale: value });
@@ -160,5 +168,10 @@ export class ControlPanel {
   setViewDistance(distance: number): void {
     this.viewDistanceState.cameraDistance = distance;
     this.cameraDistanceController?.updateDisplay();
+  }
+
+  setModelZOffset(offset: number): void {
+    this.modelZState.modelZOffset = offset;
+    this.modelZController?.updateDisplay();
   }
 }
