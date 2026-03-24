@@ -197,13 +197,9 @@ export class RenderScene {
 
   public setModelZOffset(offset: number): void {
     const clamped = this.clampModelZOffset(offset);
-    const delta = clamped - this.modelZOffset;
     this.modelZOffset = clamped;
-    this.defaultTarget.z += delta;
     if (!this.renderer.xr.isPresenting) {
-      this.orbitTarget.z += delta;
       this.applyMeshPlacement(false);
-      this.updateCameraOrbit();
     }
     this.modelZOffsetChangeHandler?.(this.modelZOffset);
   }
