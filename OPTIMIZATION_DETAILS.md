@@ -69,6 +69,7 @@ The pipeline is divided into distinct stages, each optimized for throughput and 
     *   **Continuous depth mesh:** Three.js and RawXR keep every grid triangle connected and displace its vertices from the depth texture. This deliberately favors locally textured transition surfaces over high-contrast holes at silhouettes, and avoids per-frame CPU topology classification or index-buffer uploads.
     *   **Source-aligned framing:** Auto Source View places the monitor eye at the reconstructed source-camera origin and fits all calibrated ray bounds into the active viewport. SBS fits each half separately with off-axis frusta. Manual orbit/placement switches to Free Orbit; Source View owns and disables its placement sliders.
     *   **XR anchor:** RawXR aligns the source-camera origin to the midpoint of the initial XR views once, then keeps that anchor fixed so later view motion creates parallax instead of head-locking the mesh.
+    *   **Looking Glass reuse:** `Enter Looking Glass` lazily loads the official polyfill and then starts the same RawXR mesh path rather than maintaining a second renderer. Monitor startup avoids loading the separate polyfill chunk, and session end/failure restores monitor updates. Because the polyfill replaces the page-wide WebXR runtime, generic VR is disabled after activation until reload.
     *   **Applied depth FPS:** FPS counts unique depth timestamps actually applied to the texture, not render-loop iterations or raw backend replies. This is the throughput signal returned to the automatic controller.
 
 ### 2. Tuning & Feedback Loop
@@ -153,6 +154,7 @@ The system is designed to be tunable based on hardware capabilities.
     *   **連続depth mesh:** Three.jsとRawXRは全grid triangleを接続したまま、depth textureで頂点を変位させます。silhouetteに高contrastな穴を開けず、近傍動画色の遷移面を優先する意図的な判断で、毎frameのCPU topology判定とindex-buffer更新も不要です。
     *   **source整合framing:** Auto Source Viewはmonitor eyeを再構成source-camera原点へ置き、校正ray境界全体がactive viewportへ入るようfitします。SBSは各halfをoff-axis frustumで個別fitします。manual orbit/配置でFree Orbitへ移り、Source View中は配置sliderを無効化します。
     *   **XR anchor:** RawXRはsession開始時にsource-camera原点を初期XR viewの中点へ一度だけ合わせ、その後固定します。後続view移動はmeshのhead-lockではなくparallaxになります。
+    *   **Looking Glass再利用:** `Enter Looking Glass`は公式polyfillを遅延loadしてから、別rendererではなく同じRawXR mesh pathを開始します。通常monitor起動は分離されたpolyfill chunkを読み込まず、session終了/失敗時はmonitor updateへ復帰します。polyfillはpage全体のWebXR runtimeを置き換えるため、起動後のgeneric VRはreloadまで無効化します。
     *   **適用depth FPS:** render-loop回数やbackend reply数ではなく、textureへ実際に適用した固有depth timestampを数えます。この値を自動controllerへfeedbackします。
 
 ### 2. チューニングとフィードバックループ

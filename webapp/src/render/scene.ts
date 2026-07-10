@@ -36,7 +36,6 @@ export class RenderScene {
   // VRボタン/three.js XRは使わない（RawXRに統一）
   private currentControls: ViewerControls;
   private calibration: CameraCalibration | null = null;
-  private lgPolyfillLoaded = false;
   private orbitYaw = 0;
   private orbitPitch = 0;
   private orbitRadius = 3.5;
@@ -849,37 +848,6 @@ export class RenderScene {
     this.mesh.position.set(0, this.currentControls.yOffset, this.modelZOffset);
   }
 
-  async startLookingGlass(): Promise<void> {
-    if (!this.lgPolyfillLoaded) {
-      await this.loadLookingGlassPolyfill();
-      this.lgPolyfillLoaded = true;
-    }
-    if (!('xr' in navigator)) {
-      throw new Error('WebXR is not supported in this browser (after polyfill)');
-    }
-    const sessionTypes = ['immersive-vr', 'immersive-ar'] as const;
-    let session: XRSession | null = null;
-    let lastError: unknown = null;
-    for (const type of sessionTypes) {
-      try {
-        session = await navigator.xr!.requestSession(type, {
-          requiredFeatures: [],
-          optionalFeatures: ['local-floor', 'viewer'],
-        });
-        break;
-      } catch (err) {
-        lastError = err;
-      }
-    }
-    if (!session) {
-      throw lastError ?? new Error('XR session could not be created');
-    }
-    await this.renderer.xr.setSession(session);
-    session.addEventListener('end', () => {
-      // no-op
-    });
-  }
-
   async endXR(): Promise<void> {
     const session = this.renderer.xr.getSession();
     if (session) {
@@ -1000,41 +968,4 @@ export class RenderScene {
     this.manualXRLoop();
   }
 
-  private async loadLookingGlassPolyfill(): Promise<void> {
-    // official polyfill load (no types available)
-    const anyWin = window as typeof window & { __lgPolyfill?: boolean };
-    if (anyWin.__lgPolyfill) return;
-
-    type LookingGlassPolyfillCtor = new (opts: Record<string, unknown>) => unknown;
-    type LGModule = { LookingGlassWebXRPolyfill?: LookingGlassPolyfillCtor };
-
-    const urls = [
-      '@lookingglass/webxr/dist/bundle/webxr.js',
-      'https://unpkg.com/@lookingglass/webxr@0.6.0/dist/bundle/webxr.js',
-    ];
-
-    let mod: LGModule | null = null;
-
-    for (const url of urls) {
-      try {
-        const imported = (await import(/* @vite-ignore */ url)) as unknown;
-        mod = imported as LGModule;
-        break;
-      } catch (err) {
-        console.warn('LG polyfill load failed', url, err);
-      }
-    }
-
-    if (!mod) {
-      throw new Error('Looking Glass polyfill could not be loaded');
-    }
-
-    const Polyfill = mod.LookingGlassWebXRPolyfill;
-    if (!Polyfill) {
-      throw new Error('LookingGlassWebXRPolyfill not found');
-    }
-
-    new Polyfill({});
-    anyWin.__lgPolyfill = true;
-  }
 }

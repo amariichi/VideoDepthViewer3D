@@ -90,6 +90,7 @@ function makeControllerState(hand: ControllerHand): ControllerState {
 
 export class RawXRTest {
   private state: RawXRState | null = null;
+  private pendingSession: XRSession | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private parent: HTMLElement;
   private threeScene: THREE.Scene | null = null;
@@ -227,6 +228,7 @@ export class RawXRTest {
     }
 
     const session = await this.requestSessionWithFallback();
+    this.pendingSession = session;
 
     type XRCompatibleWebGL2 = WebGL2RenderingContext & {
       makeXRCompatible?: () => Promise<void>;
@@ -438,6 +440,7 @@ export class RawXRTest {
       orbitTarget: this.orbitTarget.clone(),
       input: this.input,
     };
+    this.pendingSession = null;
 
     session.addEventListener('end', () => this.stop());
     session.addEventListener('inputsourceschange', (e) => this.handleInputSourcesChange(e));
@@ -499,27 +502,39 @@ export class RawXRTest {
   }
 
   async stop(): Promise<void> {
-    if (!this.state) return;
-    this.state.running = false;
-    if (this.state.frameHandle !== null) {
-      this.state.session.cancelAnimationFrame(this.state.frameHandle);
+    const state = this.state;
+    const session = state?.session ?? this.pendingSession;
+    const canvas = this.canvas;
+    const contextLostHandler = this.contextLostHandler;
+    const hadResources = Boolean(state || session || canvas);
+
+    // Clear shared references before ending the session. The session's `end`
+    // event calls stop() again, and this makes that re-entry a no-op.
+    this.state = null;
+    this.pendingSession = null;
+    this.canvas = null;
+    this.contextLostHandler = null;
+
+    if (!hadResources) return;
+    if (state) {
+      state.running = false;
+      if (state.frameHandle !== null) {
+        state.session.cancelAnimationFrame(state.frameHandle);
+      }
     }
-    if (this.state.session) {
+    if (session) {
       try {
-        await this.state.session.end();
+        await session.end();
       } catch {
         /* ignore */
       }
     }
-    this.state = null;
-    if (this.canvas && this.contextLostHandler) {
-      this.canvas.removeEventListener('webglcontextlost', this.contextLostHandler);
+    if (canvas && contextLostHandler) {
+      canvas.removeEventListener('webglcontextlost', contextLostHandler);
     }
-    if (this.canvas && this.canvas.parentElement) {
-      this.canvas.parentElement.removeChild(this.canvas);
+    if (canvas?.parentElement) {
+      canvas.parentElement.removeChild(canvas);
     }
-    this.canvas = null;
-    this.canvas = null;
     // Keep debugEl alive as requested
     if (this.onSessionEnded) this.onSessionEnded();
   }

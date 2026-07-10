@@ -9,6 +9,12 @@ import type { SessionInfo, DepthFrame } from './types';
 import { DepthBuffer } from './utils/depthBuffer';
 import { perfStats } from './utils/perfStats';
 import { getModeTargetTriangles } from './performance/qualityPolicy';
+import {
+  LookingGlassRuntime,
+  describeLookingGlassFailure,
+} from './lookingGlass';
+
+type XRDisplayMode = 'vr' | 'looking-glass';
 
 export class VideoDepthApp {
   private videoEl: HTMLVideoElement;
@@ -23,6 +29,7 @@ export class VideoDepthApp {
   private lastTargetTriangles = 0;
   private latestDepthFrame: DepthFrame | null = null;
   private rawXR: RawXRTest | null = null;
+  private readonly lookingGlassRuntime = new LookingGlassRuntime();
   private suppressSeekRefresh = false;
   private lastAppliedDepthTimestamp = -1;
   private currentSyncDeltaMs = 0;
@@ -110,18 +117,82 @@ export class VideoDepthApp {
 
   private mountXRButtons(): void {
     const rawVrBtn = document.getElementById('btn-vr') as HTMLButtonElement;
+    const lookingGlassBtn = document.getElementById(
+      'btn-looking-glass'
+    ) as HTMLButtonElement;
+    const lookingGlassStatus = document.getElementById(
+      'looking-glass-status'
+    ) as HTMLElement;
     const helpCheckbox = document.getElementById('chk-hints') as HTMLInputElement;
     const sbsBtn = document.getElementById('btn-sbs') as HTMLButtonElement;
     const sbsSwapCheckbox = document.getElementById('chk-sbs-swap') as HTMLInputElement;
 
-    if (!rawVrBtn || !helpCheckbox || !sbsBtn || !sbsSwapCheckbox) {
+    if (
+      !rawVrBtn ||
+      !lookingGlassBtn ||
+      !lookingGlassStatus ||
+      !helpCheckbox ||
+      !sbsBtn ||
+      !sbsSwapCheckbox
+    ) {
       console.warn('XR buttons not found in DOM');
       return;
     }
 
-    // VR button (RawXR only)
-    rawVrBtn.disabled = true;
-    rawVrBtn.addEventListener('click', async () => {
+    let activeMode: XRDisplayMode | null = null;
+    let transitioning = false;
+    let lookingGlassRuntimeSelected = false;
+
+    const setLookingGlassStatus = (
+      label: string,
+      detail: string,
+      showDetail = false
+    ): void => {
+      lookingGlassStatus.textContent = showDetail
+        ? `${label} — ${detail}`
+        : label;
+      lookingGlassStatus.title = detail;
+    };
+
+    const refreshXRButtons = (): void => {
+      const hasSession = Boolean(usePlayerStore.getState().session);
+      rawVrBtn.textContent = activeMode === 'vr'
+        ? 'Exit VR (RawXR)'
+        : 'Start VR (RawXR)';
+      lookingGlassBtn.textContent = activeMode === 'looking-glass'
+        ? 'Exit Looking Glass'
+        : 'Enter Looking Glass';
+
+      rawVrBtn.disabled =
+        !hasSession ||
+        transitioning ||
+        activeMode === 'looking-glass' ||
+        (lookingGlassRuntimeSelected && activeMode !== 'vr');
+      lookingGlassBtn.disabled =
+        !hasSession || transitioning || activeMode === 'vr';
+      rawVrBtn.title = lookingGlassRuntimeSelected
+        ? 'Looking Glass owns WebXR for this page. Reload to restore native VR.'
+        : 'Start the generic RawXR headset path.';
+    };
+
+    const handleXRSessionEnded = (): void => {
+      const endedMode = activeMode;
+      activeMode = null;
+      transitioning = false;
+      this.resumeRenderLoop();
+      if (endedMode === 'looking-glass') {
+        setLookingGlassStatus(
+          'Monitor',
+          'Looking Glass ended; monitor rendering is active.'
+        );
+        this.controlPanel.updateStatus('Looking Glass ended');
+      } else if (endedMode === 'vr') {
+        this.controlPanel.updateStatus('Raw XR ended');
+      }
+      refreshXRButtons();
+    };
+
+    const prepareRawXR = (mode: XRDisplayMode): RawXRTest => {
       if (!this.rawXR) {
         this.rawXR = new RawXRTest(document.querySelector('#canvas-container') as HTMLElement);
       }
@@ -129,17 +200,116 @@ export class VideoDepthApp {
       this.rawXR.setControlsGetter(() => this.getEffectiveViewerControls());
       this.rawXR.setCalibration(this.currentSession?.calibration ?? null);
       this.rawXR.setDepthBuffer(this.depthBuffer);
-      this.rawXR.setSessionEndedCallback(() => this.resumeRenderLoop());
+      this.rawXR.setSessionEndedCallback(handleXRSessionEnded);
       this.rawXR.enableDepthMesh();
-      this.rawXR.setHintsEnabled(helpCheckbox.checked);
+      this.rawXR.setHintsEnabled(mode === 'vr' && helpCheckbox.checked);
+      return this.rawXR;
+    };
+
+    const startXR = async (mode: XRDisplayMode): Promise<void> => {
+      if (transitioning) return;
+      if (activeMode === mode) {
+        transitioning = true;
+        refreshXRButtons();
+        await this.rawXR?.stop();
+        return;
+      }
+      if (activeMode !== null) return;
+
+      transitioning = true;
+      activeMode = mode;
+      refreshXRButtons();
+
       try {
+        if (mode === 'looking-glass') {
+          setLookingGlassStatus(
+            'Starting…',
+            'Loading the Looking Glass WebXR runtime.'
+          );
+          await this.lookingGlassRuntime.activate();
+          // The official polyfill overrides navigator.xr for the lifetime of
+          // this page. Keep generic VR disabled after this point.
+          lookingGlassRuntimeSelected = true;
+        }
+
+        const rawXR = prepareRawXR(mode);
         this.pauseRenderLoop();
-        await this.rawXR.start();
-        this.controlPanel.updateStatus('Raw XR started');
+        await rawXR.start();
+        if (activeMode !== mode) return;
+
+        let lookingGlassPresentation = {
+          displayDetected: false,
+          popupOpen: false,
+        };
+        if (mode === 'looking-glass') {
+          lookingGlassPresentation =
+            await this.lookingGlassRuntime.waitForPresentation();
+          if (activeMode !== mode) return;
+        }
+        transitioning = false;
+        if (mode === 'looking-glass') {
+          if (!lookingGlassPresentation.popupOpen) {
+            setLookingGlassStatus(
+              'Blocked',
+              'Allow pop-ups/window management, exit, and activate again.',
+              true
+            );
+            this.controlPanel.updateStatus('Looking Glass window blocked');
+          } else if (lookingGlassPresentation.displayDetected) {
+            setLookingGlassStatus(
+              'Active',
+              'Bridge calibration is active on the RawXR depth-mesh path.'
+            );
+            this.controlPanel.updateStatus('Looking Glass active');
+          } else {
+            setLookingGlassStatus(
+              'Unverified',
+              'XR preview started, but Bridge/display calibration was not detected.',
+              true
+            );
+            this.controlPanel.updateStatus('Looking Glass unverified');
+          }
+        } else {
+          this.controlPanel.updateStatus('Raw XR started');
+        }
+        refreshXRButtons();
       } catch (err) {
         console.error(err);
-        this.controlPanel.updateStatus('Raw XR failed');
+        activeMode = null;
+        lookingGlassRuntimeSelected =
+          lookingGlassRuntimeSelected || this.lookingGlassRuntime.isInstalled;
+        // start() may have created a canvas or XRSession before failing.
+        await this.rawXR?.stop();
+        this.resumeRenderLoop();
+        transitioning = false;
+        if (mode === 'looking-glass') {
+          const failure = describeLookingGlassFailure(err);
+          setLookingGlassStatus(failure.label, failure.detail, true);
+          this.controlPanel.updateStatus(`Looking Glass ${failure.label.toLowerCase()}`);
+        } else {
+          this.controlPanel.updateStatus('Raw XR failed');
+        }
+        refreshXRButtons();
       }
+    };
+
+    // Preload the code chunk on intent, but do not install the page-wide WebXR
+    // override until the explicit Looking Glass activation click.
+    const preloadLookingGlass = (): void => {
+      this.lookingGlassRuntime.preload().catch((err: unknown) => {
+        console.debug('Looking Glass preload failed', err);
+      });
+    };
+    lookingGlassBtn.addEventListener('pointerenter', preloadLookingGlass, {
+      once: true,
+    });
+    lookingGlassBtn.addEventListener('focus', preloadLookingGlass, { once: true });
+
+    rawVrBtn.addEventListener('click', () => {
+      void startXR('vr');
+    });
+    lookingGlassBtn.addEventListener('click', () => {
+      void startXR('looking-glass');
     });
 
     // VR Hints Checkbox
@@ -147,15 +317,14 @@ export class VideoDepthApp {
     helpCheckbox.addEventListener('change', () => {
       this.renderScene.setInstructionsVisible(helpCheckbox.checked);
       if (this.rawXR) {
-        this.rawXR.setHintsEnabled(helpCheckbox.checked);
+        this.rawXR.setHintsEnabled(activeMode === 'vr' && helpCheckbox.checked);
       }
       this.controlPanel.updateStatus(helpCheckbox.checked ? 'VR hints ON' : 'VR hints OFF');
     });
 
-    // Enable VR button only after a session (video) is ready
-    usePlayerStore.subscribe((state) => {
-      rawVrBtn.disabled = !state.session;
-    });
+    setLookingGlassStatus('Monitor', 'Monitor rendering is active.');
+    refreshXRButtons();
+    usePlayerStore.subscribe(() => refreshXRButtons());
 
     // SBS Toggle
     sbsBtn.addEventListener('click', () => {
@@ -449,6 +618,10 @@ export class VideoDepthApp {
     if (this.videoEl) {
       this.videoEl.pause();
     }
+
+    // XR owns its own canvas and reads the current session/depth buffer.
+    // End it before replacing or deleting those resources.
+    await this.rawXR?.stop();
 
     if (this.currentSession) {
       try {
