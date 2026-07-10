@@ -15,7 +15,35 @@ import {
 } from './render/projection';
 import { DepthBuffer } from './utils/depthBuffer';
 
-type RawXRMode = 'quad' | 'mesh' | 'three';
+export type RawXRMode = 'quad' | 'mesh' | 'three';
+
+interface DepthMeshReadiness {
+  desiredMode: RawXRMode;
+  currentMode: RawXRMode;
+  hasMesh: boolean;
+  hasDepth: boolean;
+  hasVideo: boolean;
+}
+
+/**
+ * A depth frame can arrive after the XR session has already started. Keep the
+ * recovery check independent from the mode flag: an earlier startup may have
+ * selected `mesh` before the corresponding GPU resources existed.
+ */
+export function shouldInitializeDepthMesh({
+  desiredMode,
+  currentMode,
+  hasMesh,
+  hasDepth,
+  hasVideo,
+}: DepthMeshReadiness): boolean {
+  return (
+    desiredMode === 'mesh' &&
+    (currentMode !== 'mesh' || !hasMesh) &&
+    hasDepth &&
+    hasVideo
+  );
+}
 
 interface MeshState {
   prog: WebGLProgram;
@@ -398,9 +426,9 @@ export class RawXRTest {
     gl.bindTexture(gl.TEXTURE_2D, null);
 
 
-    // Decide rendering mode: prefer depth mesh if video+depth are ready.
+    // Decide rendering mode: prefer depth mesh only after its GPU resources
+    // exist. The frame loop upgrades from the fallback as soon as depth arrives.
     const canMesh = this.depthBuffer && this.videoEl && this.desiredMode === 'mesh';
-    const mode: RawXRMode = canMesh ? 'mesh' : (this.threeScene && this.desiredMode === 'three' ? 'three' : 'quad');
 
     // Initial mesh setup if possible (though loop will handle it)
     let meshState: MeshState | undefined;
@@ -411,6 +439,9 @@ export class RawXRTest {
         meshState = this.ensureMeshResources(gl as WebGL2RenderingContext, frame, this.getControls());
       }
     }
+    const mode: RawXRMode = meshState
+      ? 'mesh'
+      : (this.threeScene && this.desiredMode === 'three' ? 'three' : 'quad');
 
     this.state = {
       session,
@@ -576,7 +607,13 @@ export class RawXRTest {
     }
 
     // If depth/video became available after session start, switch into mesh mode on the fly.
-    if (this.desiredMode === 'mesh' && s.mode !== 'mesh' && currentDepth && this.videoEl) {
+    if (shouldInitializeDepthMesh({
+      desiredMode: this.desiredMode,
+      currentMode: s.mode,
+      hasMesh: Boolean(s.mesh),
+      hasDepth: Boolean(currentDepth),
+      hasVideo: Boolean(this.videoEl),
+    }) && currentDepth && this.videoEl) {
       s.mode = 'mesh';
       s.mesh = this.ensureMeshResources(gl, currentDepth, this.getControls(), s.mesh);
     }
