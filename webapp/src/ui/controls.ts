@@ -1,9 +1,11 @@
 import GUI from 'lil-gui';
 import { usePlayerStore } from '../state/playerStore';
+import type { ViewFramingMode } from '../types';
 
 interface ControlCallbacks {
   onFileSelected: (file: File) => Promise<void>;
   getFrontendFps: () => number;
+  getSyncDeltaMs: () => number;
   getViewDistance: () => number;
   onViewDistanceChanged: (distance: number) => void;
   getModelZOffset: () => number;
@@ -22,14 +24,17 @@ export class ControlPanel {
   private perfGui: GUI;
   private elements: ControlElements;
   private callbacks: ControlCallbacks;
+  private framingState: { framingMode: ViewFramingMode } = { framingMode: 'source' };
   private viewDistanceState = { cameraDistance: 3.5 };
   private modelZState = { modelZOffset: 0 };
+  private framingModeController: ReturnType<GUI['add']> | null = null;
   private cameraDistanceController: ReturnType<GUI['add']> | null = null;
   private modelZController: ReturnType<GUI['add']> | null = null;
 
   constructor(elements: ControlElements, callbacks: ControlCallbacks) {
     this.elements = elements;
     this.callbacks = callbacks;
+    this.framingState.framingMode = usePlayerStore.getState().viewerControls.framingMode;
     this.viewDistanceState.cameraDistance = this.callbacks.getViewDistance();
     this.modelZState.modelZOffset = this.callbacks.getModelZOffset();
     this.depthGui = new GUI({ container: elements.depthGui, title: 'Depth Controls' });
@@ -52,46 +57,86 @@ export class ControlPanel {
     const store = usePlayerStore.getState();
     const folder = this.depthGui; // no extra nesting
     folder
-      .add(store.viewerControls, 'projectionMode', { Relief: 'relief', Pinhole: 'pinhole' })
+      .add(store.viewerControls, 'projectionMode', {
+        'Calibrated Pinhole': 'pinhole',
+        'Creative Relief': 'relief',
+      })
       .name('Projection')
       .onChange((value: 'relief' | 'pinhole') => {
+        if (value === 'relief') {
+          this.setFramingMode('orbit');
+          usePlayerStore.getState().updateControls({
+            projectionMode: value,
+            framingMode: 'orbit',
+          });
+          return;
+        }
         usePlayerStore.getState().updateControls({ projectionMode: value });
       });
-    folder.add(store.viewerControls, 'targetTriangles', 50_000, 300_000, 10_000).name('Target tris').onChange((value: number) => {
+    this.framingModeController = folder
+      .add(this.framingState, 'framingMode', {
+        'Auto Source View': 'source',
+        'Free Orbit': 'orbit',
+      })
+      .name('Framing')
+      .onChange((value: ViewFramingMode) => {
+        this.setFramingMode(value);
+        usePlayerStore.getState().updateControls({ framingMode: value });
+      });
+    const meshFolder = folder.addFolder('Advanced / Mesh');
+    meshFolder.add(store.viewerControls, 'targetTriangles', 50_000, 300_000, 10_000).name('Manual target tris').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ targetTriangles: value });
-    });
-    folder.add(store.viewerControls, 'fovY', 30, 90, 1).name('View FOV Y').onChange((value: number) => {
-      usePlayerStore.getState().updateControls({ fovY: value });
     });
     folder.add(store.viewerControls, 'sourceFovY', 30, 100, 1).name('Source FOV Y').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ sourceFovY: value });
     });
-    this.cameraDistanceController = folder.add(this.viewDistanceState, 'cameraDistance', 0.2, 10.0, 0.05).name('Camera Dist').onChange((value: number) => {
+    const placementFolder = folder.addFolder('View Placement');
+    placementFolder.add(store.viewerControls, 'fovY', 30, 140, 1).name('Min View FOV Y').onChange((value: number) => {
+      usePlayerStore.getState().updateControls({ fovY: value });
+    });
+    this.cameraDistanceController = placementFolder.add(this.viewDistanceState, 'cameraDistance', 0.2, 50.0, 0.05).name('Orbit Distance').onChange((value: number) => {
       this.callbacks.onViewDistanceChanged(value);
     });
-    this.modelZController = folder.add(this.modelZState, 'modelZOffset', -5.0, 5.0, 0.05).name('Model Z').onChange((value: number) => {
+    this.modelZController = placementFolder.add(this.modelZState, 'modelZOffset', -5.0, 50.0, 0.05).name('Model Z Offset').onChange((value: number) => {
       this.callbacks.onModelZOffsetChanged(value);
     });
-    folder.add(store.viewerControls, 'zScale', 0.5, 5.0, 0.05).name('Z Scale').onChange((value: number) => {
+    this.updatePlacementControlsAvailability();
+    const creativeFolder = folder.addFolder('Advanced / Creative Relief');
+    creativeFolder.add(store.viewerControls, 'zScale', 0.5, 5.0, 0.05).name('Z Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zScale: value });
     });
-    folder.add(store.viewerControls, 'zBias', -5.0, 5.0, 0.1).name('Z Bias').onChange((value: number) => {
+    creativeFolder.add(store.viewerControls, 'zBias', -5.0, 5.0, 0.1).name('Z Bias').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zBias: value });
     });
-    folder.add(store.viewerControls, 'zGamma', 0.5, 2.5, 0.05).name('Z Gamma').onChange((value: number) => {
+    creativeFolder.add(store.viewerControls, 'zGamma', 0.5, 2.5, 0.05).name('Z Gamma').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zGamma: value });
     });
     folder.add(store.viewerControls, 'zMaxClip', 5, 100, 1).name('Z Max Clip').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ zMaxClip: value });
     });
-    folder.add(store.viewerControls, 'planeScale', 0.5, 3.5, 0.1).name('Plane Scale').onChange((value: number) => {
+    creativeFolder.add(store.viewerControls, 'planeScale', 0.5, 3.5, 0.1).name('Plane Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ planeScale: value });
     });
-    folder.add(store.viewerControls, 'yOffset', 0.0, 2.0, 0.05).name('Y Offset').onChange((value: number) => {
-      usePlayerStore.getState().updateControls({ yOffset: value });
+    placementFolder.add(store.viewerControls, 'yOffset', 0.0, 2.0, 0.05).name('Y Offset').onChange((value: number) => {
+      this.setFramingMode('orbit');
+      usePlayerStore.getState().updateControls({ framingMode: 'orbit', yOffset: value });
     });
+    meshFolder.close();
+    placementFolder.close();
+    creativeFolder.close();
 
     const perfFolder = this.perfGui; // no extra nesting
+    perfFolder
+      .add(store.perfSettings, 'mode', {
+        'Auto Smooth': 'smooth',
+        'Auto Balanced': 'balanced',
+        'Auto Quality': 'quality',
+        'Manual / Creative': 'manual',
+      })
+      .name('Mode')
+      .onChange((value: 'smooth' | 'balanced' | 'quality' | 'manual') => {
+        usePlayerStore.getState().updatePerfSettings({ mode: value });
+      });
     perfFolder
       .add(store.perfSettings, 'autoLead')
       .name('Auto Lead')
@@ -123,7 +168,14 @@ export class ControlPanel {
       decode: 0,
       inflight: 0,
       res: 0,
+      downsample: 0,
+      payloadKb: 0,
+      mode: '-',
+      encoding: '-',
+      limiting: '-',
+      calibration: '-',
       fps: 0,
+      syncMs: 0,
     };
     const monitorFolder = perfFolder.addFolder('Live Telemetry');
     monitorFolder.add(stats, 'queue').name('Queue (s)').listen().disable();
@@ -133,7 +185,14 @@ export class ControlPanel {
     monitorFolder.add(stats, 'send').name('Send (s)').listen().disable();
     monitorFolder.add(stats, 'inflight').name('Inflight').listen().disable();
     monitorFolder.add(stats, 'res').name('Resolution').listen().disable();
+    monitorFolder.add(stats, 'downsample').name('Downsample').listen().disable();
+    monitorFolder.add(stats, 'payloadKb').name('Payload (KiB)').listen().disable();
+    monitorFolder.add(stats, 'mode').name('Mode').listen().disable();
+    monitorFolder.add(stats, 'encoding').name('Encoding').listen().disable();
+    monitorFolder.add(stats, 'limiting').name('Limiter').listen().disable();
+    monitorFolder.add(stats, 'calibration').name('Calibration').listen().disable();
     monitorFolder.add(stats, 'fps').name('Depth FPS').listen().disable();
+    monitorFolder.add(stats, 'syncMs').name('Sync delta (ms)').listen().disable();
 
     setInterval(async () => {
       const client = usePlayerStore.getState().depthClient;
@@ -150,12 +209,24 @@ export class ControlPanel {
         }
         if (data && data.config) {
           stats.res = Math.trunc(data.config.process_res ?? 0);
+          stats.downsample = Math.trunc(data.config.downsample_factor ?? 0);
+          stats.mode = data.config.mode ?? '-';
+          stats.encoding = data.config.encoding ?? '-';
+          stats.limiting = data.config.limiting_stage ?? '-';
+        }
+        if (data?.calibration) {
+          stats.calibration = `${data.calibration.origin} ${Math.round(
+            data.calibration.confidence * 100
+          )}%`;
         }
         if (data && data.rolling_stats) {
-          // stats.fps = parseFloat(data.rolling_stats.depth_fps?.toFixed(1) ?? '0');
+          stats.payloadKb = parseFloat(
+            ((data.rolling_stats.payload_avg_bytes ?? 0) / 1024).toFixed(1)
+          );
         }
       }
       stats.fps = this.callbacks.getFrontendFps();
+      stats.syncMs = parseFloat(this.callbacks.getSyncDeltaMs().toFixed(1));
     }, 500);
 
     perfFolder.close();
@@ -173,5 +244,17 @@ export class ControlPanel {
   setModelZOffset(offset: number): void {
     this.modelZState.modelZOffset = offset;
     this.modelZController?.updateDisplay();
+  }
+
+  setFramingMode(mode: ViewFramingMode): void {
+    this.framingState.framingMode = mode;
+    this.framingModeController?.updateDisplay();
+    this.updatePlacementControlsAvailability();
+  }
+
+  private updatePlacementControlsAvailability(): void {
+    const sourceViewOwnsPlacement = this.framingState.framingMode === 'source';
+    this.cameraDistanceController?.disable(sourceViewOwnsPlacement);
+    this.modelZController?.disable(sourceViewOwnsPlacement);
   }
 }

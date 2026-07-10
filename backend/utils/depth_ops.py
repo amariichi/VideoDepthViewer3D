@@ -6,6 +6,26 @@ import cv2
 import numpy as np
 
 
+def calculate_depth_target_size(
+    frame_width: int,
+    frame_height: int,
+    process_res: int,
+    downsample_factor: int,
+) -> tuple[int, int]:
+    """Choose transport size without upsampling beyond inference detail."""
+
+    width = max(int(frame_width), 1)
+    height = max(int(frame_height), 1)
+    longest = max(width, height)
+    factor = max(int(downsample_factor), 1)
+    # The factor applies to useful inference detail, not coded RGB size. If it
+    # were applied only to a 4K source, factors 2-4 could still exceed a 640 px
+    # model raster and have no effect on transport.
+    target_longest = min(longest, max(int(process_res), 1)) / factor
+    scale = min(target_longest / longest, 1.0)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
 def downsample_depth(depth: np.ndarray, factor: int) -> np.ndarray:
     """Downsample a depth map using area interpolation.
 

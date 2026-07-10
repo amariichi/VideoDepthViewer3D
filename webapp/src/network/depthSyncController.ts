@@ -44,11 +44,20 @@ export class DepthSyncController {
         const { perfSettings } = this.getState();
 
         // 1. Update maxInflightRequests based on backend capacity
-        if (status.config && status.config.inference_workers) {
+        if (
+            perfSettings.mode !== 'manual' &&
+            status.config &&
+            status.config.inference_workers
+        ) {
             // Allow more inflight requests to cover network latency (Little's Law)
             // With high RTT, we need Inflight > Workers to keep the pipeline full.
             // Factor of 4 allows for RTT up to 4x the processing time.
-            const targetInflight = status.config.inference_workers * 4;
+            const multiplier = perfSettings.mode === 'smooth'
+                ? 2
+                : perfSettings.mode === 'balanced'
+                  ? 3
+                  : 4;
+            const targetInflight = status.config.inference_workers * multiplier;
             if (perfSettings.maxInflightRequests !== targetInflight) {
                 this.updatePerfSettings({ maxInflightRequests: targetInflight });
                 console.debug(`[SyncController] Adjusted maxInflight to ${targetInflight}`);

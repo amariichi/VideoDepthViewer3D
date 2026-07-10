@@ -19,6 +19,7 @@ export interface PlayerState {
 
 const defaultControls: ViewerControls = {
   projectionMode: 'pinhole',
+  framingMode: 'source',
   targetTriangles: 200_000,
   fovY: 50,
   sourceFovY: 50,
@@ -37,9 +38,10 @@ const getUrlParam = (key: string): number | null => {
 };
 
 const defaultPerfSettings: PerfSettings = {
+  mode: 'balanced',
   depthLeadMs: 2000,
   maxInflightRequests: getUrlParam('maxInflight') || 8,
-  autoLead: false,
+  autoLead: true,
 };
 
 import { DepthSyncController } from '../network/depthSyncController';

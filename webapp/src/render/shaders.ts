@@ -7,7 +7,8 @@ export const vertexShader = /* glsl */ `
   uniform float zMaxClip;
   uniform float planeScale;
   uniform float projectionMix;
-  uniform float tanHalfSourceFovY;
+  uniform vec2 focalNorm;
+  uniform vec2 principalUv;
   varying vec2 vUv;
   varying vec2 vSampleUv;
 
@@ -27,11 +28,10 @@ export const vertexShader = /* glsl */ `
     float z = zDepth + zBias;
     float reliefX = (0.5 - vUv.x) * aspect * planeScale;
     float reliefY = (0.5 - vUv.y) * planeScale;
-    // For pinhole mode, normalize the existing planeScale so the default value
-    // stays close to a unit display scale.
-    float pinholeSpread = (2.0 * tanHalfSourceFovY) * (0.5 * planeScale);
-    float pinholeX = (0.5 - vUv.x) * aspect * pinholeSpread * z;
-    float pinholeY = (0.5 - vUv.y) * pinholeSpread * z;
+    // Exact pinhole inverse projection in texture coordinates. principalUv uses
+    // a bottom-left texture origin so it is shared by video and depth textures.
+    float pinholeX = ((vSampleUv.x - principalUv.x) / focalNorm.x) * z;
+    float pinholeY = ((vSampleUv.y - principalUv.y) / focalNorm.y) * z;
     float x = mix(reliefX, pinholeX, projectionMix);
     float y = mix(reliefY, pinholeY, projectionMix);
     vec4 displaced = vec4(x, y, -z, 1.0);

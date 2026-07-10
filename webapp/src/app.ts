@@ -8,6 +8,7 @@ import type { SessionInfo, DepthFrame } from './types';
 
 import { DepthBuffer } from './utils/depthBuffer';
 import { perfStats } from './utils/perfStats';
+import { getModeTargetTriangles } from './performance/qualityPolicy';
 
 export class VideoDepthApp {
   private videoEl: HTMLVideoElement;
@@ -19,8 +20,12 @@ export class VideoDepthApp {
   private renderRafId: number | null = null;
   private depthBuffer = new DepthBuffer();
   private lastAspect = 0;
+  private lastTargetTriangles = 0;
+  private latestDepthFrame: DepthFrame | null = null;
   private rawXR: RawXRTest | null = null;
   private suppressSeekRefresh = false;
+  private lastAppliedDepthTimestamp = -1;
+  private currentSyncDeltaMs = 0;
 
   constructor(root: HTMLElement) {
     // ... (existing constructor code)
@@ -51,6 +56,7 @@ export class VideoDepthApp {
       {
         onFileSelected: async (file) => this.handleFileSelected(file),
         getFrontendFps: () => this.getFrontendFps(),
+        getSyncDeltaMs: () => this.currentSyncDeltaMs,
         getViewDistance: () => this.renderScene.getViewDistance(),
         onViewDistanceChanged: (distance) => this.renderScene.setViewDistance(distance),
         getModelZOffset: () => this.renderScene.getModelZOffset(),
@@ -62,6 +68,13 @@ export class VideoDepthApp {
     });
     this.renderScene.setModelZOffsetChangeHandler((offset) => {
       this.controlPanel.setModelZOffset(offset);
+    });
+    this.renderScene.setFramingModeChangeHandler((mode) => {
+      this.controlPanel.setFramingMode(mode);
+      const state = usePlayerStore.getState();
+      if (state.viewerControls.framingMode !== mode) {
+        state.updateControls({ framingMode: mode });
+      }
     });
 
     // Manual Open Video button handler to ensure video is paused BEFORE file dialog opens
@@ -79,8 +92,10 @@ export class VideoDepthApp {
 
 
 
-    usePlayerStore.subscribe((state) => {
-      this.renderScene.updateControls(state.viewerControls);
+    usePlayerStore.subscribe(() => {
+      const controls = this.getEffectiveViewerControls();
+      this.renderScene.updateControls(controls);
+      this.lastTargetTriangles = controls.targetTriangles;
     });
 
     this.mountXRButtons();
@@ -111,7 +126,8 @@ export class VideoDepthApp {
         this.rawXR = new RawXRTest(document.querySelector('#canvas-container') as HTMLElement);
       }
       this.rawXR.setVideo(this.videoEl);
-      this.rawXR.setControlsGetter(() => usePlayerStore.getState().viewerControls);
+      this.rawXR.setControlsGetter(() => this.getEffectiveViewerControls());
+      this.rawXR.setCalibration(this.currentSession?.calibration ?? null);
       this.rawXR.setDepthBuffer(this.depthBuffer);
       this.rawXR.setSessionEndedCallback(() => this.resumeRenderLoop());
       this.rawXR.enableDepthMesh();
@@ -177,9 +193,12 @@ export class VideoDepthApp {
     // フルスクリーン解除時はSBSもOFFに戻す
     document.addEventListener('fullscreenchange', () => {
       const inFull = Boolean(document.fullscreenElement);
+      // Fullscreen changes the container dimensions without reliably emitting
+      // a window resize in every browser. Re-measure now and once after layout.
+      this.renderScene.resize();
+      window.requestAnimationFrame(() => this.renderScene.resize());
       if (!inFull && this.renderScene.isSbsEnabled()) {
         this.renderScene.setSbsEnabled(false);
-        this.renderScene.resize();
         sbsBtn.dataset.enabled = 'false';
         sbsBtn.textContent = 'SBS Stereo (0DOF)';
         document.body.classList.remove('sbs-active');
@@ -194,7 +213,13 @@ export class VideoDepthApp {
     const session = await uploadVideo(file);
     this.currentSession = session;
     usePlayerStore.getState().setSession(session);
-    this.controlPanel.updateStatus(`Session ${session.sessionId} (${session.width}x${session.height})`);
+    usePlayerStore.getState().updateControls({ framingMode: 'source' });
+    this.controlPanel.setFramingMode('source');
+    this.renderScene.setCalibration(session.calibration);
+    this.rawXR?.setCalibration(session.calibration);
+    this.controlPanel.updateStatus(
+      `Session ${session.sessionId} (${session.displayWidth}x${session.displayHeight})`
+    );
     this.openVideo(file);
     this.openDepthStream(session);
   }
@@ -214,7 +239,11 @@ export class VideoDepthApp {
 
   private openDepthStream(session: SessionInfo): void {
     this.depthClient?.close();
-    this.depthClient = new DepthClient(session.sessionId, () => usePlayerStore.getState().perfSettings);
+    this.depthClient = new DepthClient(
+      session.sessionId,
+      () => usePlayerStore.getState().perfSettings,
+      () => this.getFrontendFps()
+    );
     usePlayerStore.getState().setDepthClient(this.depthClient);
     this.depthClient.onDepth((frame) => this.handleDepthFrame(frame));
     this.depthClient.onStatus(({ connected }) => {
@@ -223,6 +252,8 @@ export class VideoDepthApp {
     this.depthClient.connect();
     // Reset buffer on new stream
     this.depthBuffer = new DepthBuffer();
+    this.lastAppliedDepthTimestamp = -1;
+    this.latestDepthFrame = null;
     this.startHealthReporting();
   }
 
@@ -230,16 +261,26 @@ export class VideoDepthApp {
     const start = performance.now();
     // Store in buffer instead of immediate render
     this.depthBuffer.add(frame);
+    this.latestDepthFrame = frame;
     perfStats.add('app.handleDepthFrame', performance.now() - start);
 
     // Update aspect ratio if needed (only once or if changed)
     // We can do this in render loop or here.
     // Doing it here is fine for metadata.
-    const aspect = frame.width / frame.height;
-    if (Math.abs(aspect - this.lastAspect) > 0.01) {
-      const controls = usePlayerStore.getState().viewerControls;
+    const aspect =
+      this.currentSession?.calibration.displayWidth &&
+      this.currentSession.calibration.displayHeight
+        ? this.currentSession.calibration.displayWidth /
+          this.currentSession.calibration.displayHeight
+        : frame.width / frame.height;
+    const controls = this.getEffectiveViewerControls(frame);
+    if (
+      Math.abs(aspect - this.lastAspect) > 0.01 ||
+      controls.targetTriangles !== this.lastTargetTriangles
+    ) {
       this.renderScene.updateMeshResolution(aspect, controls);
       this.lastAspect = aspect;
+      this.lastTargetTriangles = controls.targetTriangles;
     }
   }
 
@@ -255,11 +296,15 @@ export class VideoDepthApp {
         const timeMs = this.videoEl.currentTime * 1000;
         const frame = this.depthBuffer.getFrame(timeMs);
         if (frame) {
-          const controls = usePlayerStore.getState().viewerControls;
-          this.renderScene.updateDepth(frame, controls);
-          perfStats.add('app.sync.delta', Math.abs(timeMs - frame.timestampMs));
+          if (frame.timestampMs !== this.lastAppliedDepthTimestamp) {
+            const controls = this.getEffectiveViewerControls(frame);
+            this.renderScene.updateDepth(frame, controls);
+            this.lastAppliedDepthTimestamp = frame.timestampMs;
+            this.frameCount++;
+          }
+          this.currentSyncDeltaMs = Math.abs(timeMs - frame.timestampMs);
+          perfStats.add('app.sync.delta', this.currentSyncDeltaMs);
           perfStats.add('app.sync.miss', 0);
-          this.frameCount++;
         } else {
           // Only log miss if we actually wanted a frame (video playing)
           // and buffer wasn't empty (if empty, it's starvation, handled below)
@@ -298,6 +343,19 @@ export class VideoDepthApp {
 
   public getFrontendFps(): number {
     return this.currentFps;
+  }
+
+  private getEffectiveViewerControls(frame = this.latestDepthFrame) {
+    const state = usePlayerStore.getState();
+    return {
+      ...state.viewerControls,
+      targetTriangles: getModeTargetTriangles(
+        state.perfSettings.mode,
+        state.viewerControls.targetTriangles,
+        frame?.width,
+        frame?.height
+      ),
+    };
   }
 
   private updateFps(): void {
@@ -371,6 +429,10 @@ export class VideoDepthApp {
         for (const t of batch) {
           this.depthClient.requestDepth(t);
         }
+        // Reserve only requests that were actually admitted by flow control.
+        // getMissing() can return the whole look-ahead window, which is larger
+        // than the available slots on most frames.
+        this.depthBuffer.markRequested(batch);
       }
 
       // Cleanup old requests
@@ -407,6 +469,11 @@ export class VideoDepthApp {
       this.renderRafId = null;
     }
     this.depthBuffer = new DepthBuffer();
+    this.lastAppliedDepthTimestamp = -1;
+    this.latestDepthFrame = null;
+    this.lastTargetTriangles = 0;
+    this.renderScene.setCalibration(null);
+    this.rawXR?.setCalibration(null);
     if (this.healthIntervalId !== null) {
       window.clearInterval(this.healthIntervalId);
       this.healthIntervalId = null;
@@ -416,6 +483,8 @@ export class VideoDepthApp {
   private handleVideoEnded(): void {
     // Reset playback position and depth buffers so replay works
     this.depthBuffer.clear();
+    this.lastAppliedDepthTimestamp = -1;
+    this.latestDepthFrame = null;
     this.suppressSeekRefresh = true;
     this.videoEl.currentTime = 0;
     // Refresh depth stream connection to drop pending/inflight safely
@@ -434,6 +503,8 @@ export class VideoDepthApp {
     if (!this.depthClient || !this.currentSession) return;
     // Drop stale future requests and frames after explicit timeline jumps.
     this.depthBuffer.clear();
+    this.lastAppliedDepthTimestamp = -1;
+    this.latestDepthFrame = null;
     this.depthClient.close();
     this.depthClient.connect();
   }
@@ -450,7 +521,6 @@ export class VideoDepthApp {
       const rtt = this.depthClient.getRTT();
       const jitter = this.depthClient.getJitter();
       const inflight = this.depthClient.getInflightCount();
-      // const fps = 0; // TODO: Implement FPS tracking in DepthClient if needed
 
       const msg = `[Health] Buffer=${bufferSize} RTT=${rtt.toFixed(0)}ms Jitter=${jitter.toFixed(1)}ms Inflight=${inflight}`;
 

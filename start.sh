@@ -18,7 +18,7 @@ export VIDEO_DEPTH_DOWNSAMPLE=${VIDEO_DEPTH_DOWNSAMPLE:-1}
 export UV_CACHE_DIR=${UV_CACHE_DIR:-.uv-cache}
 export DA3_LOG_LEVEL=WARN
 
-uv run python3 scripts/run_backend.py --reload &
+uv run --locked --extra inference python3 scripts/run_backend.py --reload &
 BACKEND_PID=$!
 
 # Start Frontend
@@ -26,7 +26,7 @@ echo "Starting Frontend..."
 cd webapp
 if [ ! -d "node_modules" ]; then
     echo "Installing frontend dependencies..."
-    npm install
+    npm ci
 fi
 npm run dev &
 FRONTEND_PID=$!

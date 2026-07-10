@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -10,10 +12,17 @@ from pathlib import Path
 from typing import Deque, Optional
 
 import numpy as np
-import logging
 from fastapi import UploadFile
 
 from backend.config import get_settings
+from backend.utils.adaptive_quality import (
+    AdaptiveQualityController,
+    QualityMetrics,
+    normalize_depth_encoding,
+    normalize_performance_mode,
+)
+from backend.utils.calibration import CameraCalibration, build_fallback_calibration
+from backend.utils.depth_range import StableDepthRange
 from backend.video.io import DecoderPool, VideoMetadata
 
 
@@ -31,32 +40,85 @@ class VideoSession:
     source_path: Path
     metadata: VideoMetadata
     decoder: DecoderPool  # Changed from FrameDecoder
+    calibration: CameraCalibration = field(init=False)
+    quality_controller: AdaptiveQualityController = field(init=False, repr=False)
+    depth_range: StableDepthRange = field(init=False, repr=False)
     depth_buffer: Deque[DepthFrame] = field(init=False)
     last_depth_time_ms: float | None = None
     telemetry: dict[str, float] = field(default_factory=dict, init=False)
     rolling_stats: dict[str, float] = field(default_factory=lambda: {
         "depth_fps": 0.0,
         "latency_ms": 0.0,
+        "client_fps": 0.0,
         "infer_avg_s": 0.0,
+        "infer_wait_avg_s": 0.0,
         "queue_avg_s": 0.0,
         "ws_send_avg_s": 0.0,
+        "decode_avg_s": 0.0,
+        "payload_avg_bytes": 0.0,
         "drop_count": 0.0,
     }, init=False)
     _buffer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, init=False)
-
-    _quality_cooldown: int = field(default=0, init=False)
+    _delivery_window_start_s: float | None = field(default=None, repr=False, init=False)
+    _delivery_window_count: int = field(default=0, repr=False, init=False)
 
     def __post_init__(self) -> None:
         settings = get_settings()
         self.depth_buffer = deque(maxlen=settings.video_cache_size)
-        self._quality_cooldown = 0
+        self.calibration = build_fallback_calibration(
+            source_width=self.metadata.width,
+            source_height=self.metadata.height,
+            sar_numerator=self.metadata.sample_aspect_ratio_numerator,
+            sar_denominator=self.metadata.sample_aspect_ratio_denominator,
+            rotation_degrees=self.metadata.rotation_degrees,
+            fov_y_degrees=settings.source_fov_y,
+        )
+        self.depth_range = StableDepthRange()
+        self.quality_controller = AdaptiveQualityController(
+            mode=normalize_performance_mode(settings.optimization_mode),
+            max_process_res=settings.depth_process_res,
+            manual_downsample=settings.depth_downsample_factor,
+            manual_encoding=normalize_depth_encoding(settings.depth_encoding),
+            source_fps=self.metadata.fps,
+        )
 
     async def store_depth_frame(self, frame: DepthFrame) -> None:
         async with self._buffer_lock:
-            self.depth_buffer.append(frame)
-            self.last_depth_time_ms = frame.timestamp_ms
+            # Pipelines complete out of order. Keep the small cache ordered by
+            # media time so cache eviction/drop-on-hit semantics remain valid,
+            # and replace duplicate decoded PTS instead of wasting slots.
+            maxlen = self.depth_buffer.maxlen
+            frames = [
+                cached
+                for cached in self.depth_buffer
+                if abs(cached.timestamp_ms - frame.timestamp_ms) >= 1.0
+            ]
+            frames.append(frame)
+            frames.sort(key=lambda cached: cached.timestamp_ms)
+            if maxlen is not None:
+                frames = frames[-maxlen:]
+            self.depth_buffer = deque(frames, maxlen=maxlen)
+            self.last_depth_time_ms = self.depth_buffer[-1].timestamp_ms
 
-    async def update_telemetry(self, metrics: dict[str, float]) -> None:
+    async def stabilize_depth_range(
+        self,
+        frame_min: float,
+        frame_max: float,
+    ) -> tuple[float, float]:
+        async with self._buffer_lock:
+            return self.depth_range.update(frame_min, frame_max)
+
+    async def set_performance_mode(self, value: object) -> None:
+        mode = normalize_performance_mode(value)
+        async with self._buffer_lock:
+            self.quality_controller.set_mode(mode)
+
+    async def update_telemetry(
+        self,
+        metrics: dict[str, float],
+        *,
+        adjust_quality: bool = False,
+    ) -> None:
         async with self._buffer_lock:
             self.telemetry.update(metrics)
             
@@ -65,7 +127,13 @@ class VideoSession:
             for key, val in metrics.items():
                 if key == "dropped":
                     self.rolling_stats["drop_count"] += val
-                elif key in ["infer_s", "queue_wait_s", "ws_send_s", "decode_s"]:
+                elif key in [
+                    "infer_s",
+                    "infer_wait_s",
+                    "queue_wait_s",
+                    "ws_send_s",
+                    "decode_s",
+                ]:
                     if key == "queue_wait_s":
                         avg_key = "queue_avg_s"
                     elif key.endswith("_s"):
@@ -78,98 +146,57 @@ class VideoSession:
                         self.rolling_stats[avg_key] = val
                     else:
                         self.rolling_stats[avg_key] = alpha * val + (1 - alpha) * current
-                elif key in ["latency_ms", "depth_fps"]:
+                elif key in ["latency_ms", "depth_fps", "client_fps"]:
                     current = self.rolling_stats.get(key, 0.0)
                     if current == 0.0:
                         self.rolling_stats[key] = val
                     else:
                         self.rolling_stats[key] = alpha * val + (1 - alpha) * current
+                elif key == "payload_bytes":
+                    current = self.rolling_stats["payload_avg_bytes"]
+                    self.rolling_stats["payload_avg_bytes"] = (
+                        val if current == 0.0 else alpha * val + (1 - alpha) * current
+                    )
             
-            # Calculate FPS if total_s is present
-            if "total_s" in metrics and metrics["total_s"] > 0:
-                fps_sample = 1.0 / metrics["total_s"]
-                current_fps = self.rolling_stats.get("depth_fps", 0.0)
-                if current_fps == 0.0:
-                    self.rolling_stats["depth_fps"] = fps_sample
+            # Delivery FPS is based on actual response spacing. Per-task
+            # 1/total_s is not throughput when several pipelines overlap.
+            if adjust_quality:
+                now = time.perf_counter()
+                if self._delivery_window_start_s is None:
+                    self._delivery_window_start_s = now
+                    self._delivery_window_count = 1
                 else:
-                    self.rolling_stats["depth_fps"] = alpha * fps_sample + (1 - alpha) * current_fps
+                    self._delivery_window_count += 1
+                elapsed_s = now - self._delivery_window_start_s
+                if elapsed_s >= 1.0:
+                    fps_sample = self._delivery_window_count / elapsed_s
+                    current_fps = self.rolling_stats.get("depth_fps", 0.0)
+                    if current_fps == 0.0:
+                        self.rolling_stats["depth_fps"] = fps_sample
+                    else:
+                        self.rolling_stats["depth_fps"] = (
+                            alpha * fps_sample + (1 - alpha) * current_fps
+                        )
+                    self._delivery_window_start_s = now
+                    self._delivery_window_count = 0
 
-            # Periodically adjust quality
-            self.adjust_quality()
+            if adjust_quality:
+                self.adjust_quality()
 
     def adjust_quality(self) -> None:
-        """
-        Dynamically adjust process resolution based on inference time.
-        Target: infer_avg_s < 0.1s (10 FPS)
-        """
-        # Cooldown check (e.g., wait 30 frames between adjustments)
-        if self._quality_cooldown > 0:
-            self._quality_cooldown -= 1
-            return
-
-        infer_avg = self.rolling_stats.get("infer_avg_s", 0.0)
-        queue_avg = self.rolling_stats.get("queue_avg_s", 0.0)
-        latency_ms = self.rolling_stats.get("latency_ms", 0.0)
         settings = get_settings()
-        
-        # Initialize if not present
-        if "quality_process_res" not in self.telemetry:
-             self.telemetry["quality_process_res"] = float(settings.depth_process_res)
-
-        current_res = int(self.telemetry["quality_process_res"])
-        
-        # Available steps for resolution
-        all_steps = [960, 720, 640, 512, 480, 384, 320]
-        
-        # Clamp max resolution
-        max_res = int(settings.depth_process_res)
-        steps = [s for s in all_steps if s <= max_res]
-        
-        if not steps:
-            steps = [max_res]
-            
-        # Find closest step
-        closest_step = min(steps, key=lambda x: abs(x - current_res))
-        current_idx = steps.index(closest_step)
-
-        # Thresholds
-        UP_THRESHOLD = 0.20  # Infer > 200ms
-        DOWN_THRESHOLD = 0.08 # Infer < 80ms
-        
-        QUEUE_UP_THRESHOLD = 0.30 # Queue > 300ms
-        QUEUE_DOWN_THRESHOLD = 0.10 # Queue < 100ms
-        
-        # Latency (RTT) Thresholds for Network Congestion
-        # If RTT > 500ms, we are likely sending too much data.
-        LATENCY_UP_THRESHOLD = 500.0 
-        LATENCY_DOWN_THRESHOLD = 200.0
-        
-        new_idx = current_idx
-        
-        # Logic: Reduce quality if ANY metric is bad
-        if (infer_avg > UP_THRESHOLD or 
-            queue_avg > QUEUE_UP_THRESHOLD or 
-            latency_ms > LATENCY_UP_THRESHOLD):
-            
-            # Reduce resolution (increase index)
-            if current_idx < len(steps) - 1:
-                new_idx = current_idx + 1
-                
-        # Logic: Increase quality ONLY if ALL metrics are good
-        elif (infer_avg < DOWN_THRESHOLD and 
-              queue_avg < QUEUE_DOWN_THRESHOLD and 
-              latency_ms < LATENCY_DOWN_THRESHOLD):
-              
-            # Increase resolution (decrease index)
-            if current_idx > 0:
-                new_idx = current_idx - 1
-                
-        new_res = steps[new_idx]
-        
-        if new_res != current_res:
-            self.telemetry["quality_process_res"] = float(new_res)
-            self._quality_cooldown = 60
-            # print(f"Adjusting quality: {current_res} -> {new_res} (infer={infer_avg:.3f}s, rtt={latency_ms:.0f}ms)")
+        self.quality_controller.observe(
+            QualityMetrics(
+                infer_s=self.rolling_stats.get("infer_avg_s", 0.0),
+                infer_wait_s=self.rolling_stats.get("infer_wait_avg_s", 0.0),
+                decode_s=self.rolling_stats.get("decode_avg_s", 0.0),
+                queue_s=self.rolling_stats.get("queue_avg_s", 0.0),
+                send_s=self.rolling_stats.get("ws_send_avg_s", 0.0),
+                latency_ms=self.rolling_stats.get("latency_ms", 0.0),
+                applied_fps=self.rolling_stats.get("client_fps", 0.0),
+                worker_count=settings.inference_worker_count,
+            )
+        )
 
     async def get_cached_depth(self, time_ms: float, tolerance_ms: float = 33.0, drop_on_hit: bool = False) -> Optional[DepthFrame]:
         async with self._buffer_lock:
@@ -183,7 +210,7 @@ class VideoSession:
                     return cached
         return None
 
-    async def buffer_snapshot(self) -> dict[str, Optional[float | int | dict[str, float]]]:
+    async def buffer_snapshot(self) -> dict[str, object]:
         async with self._buffer_lock:
             size = len(self.depth_buffer)
             last = self.last_depth_time_ms
@@ -217,9 +244,7 @@ class SessionManager:
             while chunk := await upload.read(1024 * 1024):
                 dst.write(chunk)
         
-        # Use DecoderPool with 16 workers to match MAX_CONCURRENT_TASKS
-        # This prevents decoder starvation where tasks wait for a free decoder.
-        decoder = DecoderPool(target, count=16)
+        decoder = DecoderPool(target, count=self.settings.decoder_worker_count)
         metadata = decoder.metadata()
         session = VideoSession(
             session_id=session_id,

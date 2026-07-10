@@ -15,6 +15,8 @@ export function createGridGeometry({ aspect, targetTriangles }: MeshConfig): THR
     const stride = Math.ceil(segmentsY / 1024);
     segmentsY = Math.max(2, Math.floor(segmentsY / stride));
   }
+  // Keep the full grid connected. Cutting depth-discontinuity triangles creates
+  // high-contrast cracks under oblique or multi-view rendering.
   const geometry = new THREE.PlaneGeometry(1, 1, segmentsX, segmentsY);
   geometry.computeVertexNormals();
   return geometry;

@@ -25,6 +25,7 @@ dev = [
     "ruff>=0.6"
 ]
 inference = [
+    "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3@2c21ea849ceec7b469a3e62ea0c0e270afc3281a",
     "torch>=2.4",
     "torchvision>=0.19",
     "transformers>=4.44",
@@ -39,3 +40,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["backend*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]

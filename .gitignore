@@ -25,4 +25,5 @@ Thumbs.db
 
 # Project specific
 tmp/
+.playwright-cli/
 backend_stats.txt

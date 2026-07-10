@@ -2,8 +2,17 @@
 
 import * as THREE from 'three';
 import { drawThreeStereo } from './xrThreeBridge';
-import type { DepthFrame, ViewerControls } from './types';
-import { getProjectionMix, getTanHalfSourceFovY } from './render/projection';
+import type {
+  CameraCalibration,
+  DepthFrame,
+  ViewerControls,
+  ViewFramingMode,
+} from './types';
+import {
+  getEffectiveGeometryControls,
+  getProjectionCalibration,
+  getProjectionMix,
+} from './render/projection';
 import { DepthBuffer } from './utils/depthBuffer';
 
 type RawXRMode = 'quad' | 'mesh' | 'three';
@@ -27,7 +36,8 @@ interface MeshState {
     zMaxClip: WebGLUniformLocation | null;
     planeScale: WebGLUniformLocation | null;
     projectionMix: WebGLUniformLocation | null;
-    tanHalfSourceFovY: WebGLUniformLocation | null;
+    focalNorm: WebGLUniformLocation | null;
+    principalUv: WebGLUniformLocation | null;
   };
 }
 
@@ -89,6 +99,7 @@ export class RawXRTest {
   private contextLostHandler: ((ev: Event) => void) | null = null;
   private videoEl: HTMLVideoElement | null = null;
   private controlsGetter: (() => ViewerControls) | null = null;
+  private calibration: CameraCalibration | null = null;
   private depthBuffer: DepthBuffer | null = null;
   private lastRenderedDepthFrame: DepthFrame | null = null;
   private meshModel: THREE.Matrix4 = new THREE.Matrix4();
@@ -96,12 +107,16 @@ export class RawXRTest {
   private orbitPitch = 0;
   private orbitRadius = 2.0;
   private orbitTarget = new THREE.Vector3(0, 0.6, -1.2);
+  private xrFramingMode: ViewFramingMode | null = null;
+  private sourceViewBaseOrientation = new THREE.Quaternion();
   private input = {
     left: makeControllerState('left'),
     right: makeControllerState('right'),
   };
   private debugEl: HTMLDivElement | null = null;
   private placeholderDepth: DepthFrame | null = null;
+  private lastUploadedDepthTimestamp = -1;
+  private lastUploadedVideoFrame = -1;
   private hintCanvas: HTMLCanvasElement;
   private hintCtx: CanvasRenderingContext2D | null;
   private hintTimeout: number | null = null;
@@ -154,6 +169,10 @@ export class RawXRTest {
     this.controlsGetter = fn;
   }
 
+  setCalibration(calibration: CameraCalibration | null): void {
+    this.calibration = calibration;
+  }
+
   private onSessionEnded: (() => void) | null = null;
 
   setSessionEndedCallback(cb: () => void): void {
@@ -162,6 +181,9 @@ export class RawXRTest {
 
   setDepthBuffer(buffer: DepthBuffer): void {
     this.depthBuffer = buffer;
+    this.lastRenderedDepthFrame = null;
+    this.lastUploadedDepthTimestamp = -1;
+    this.lastUploadedVideoFrame = -1;
   }
 
   enableDepthMesh(): void {
@@ -179,6 +201,13 @@ export class RawXRTest {
     if (!supported) {
       throw new Error('immersive-vr not supported');
     }
+
+    this.xrFramingMode = null;
+    this.sourceViewBaseOrientation.identity();
+    this.orbitYaw = 0;
+    this.orbitPitch = 0;
+    this.orbitRadius = 2.0;
+    this.orbitTarget.set(0, 0.6, -1.2);
 
     this.canvas = document.createElement('canvas');
     this.canvas.style.position = 'absolute';
@@ -513,6 +542,7 @@ export class RawXRTest {
     gl.bindFramebuffer(gl.FRAMEBUFFER, s.baseLayer.framebuffer);
     gl.enable(gl.SCISSOR_TEST);
 
+    this.syncViewerSourceAnchor(pose, this.getControls().framingMode);
     this.updateFromControllers(s.session, frame, s.refSpace);
 
     // Pull latest depth frame from buffer
@@ -539,11 +569,29 @@ export class RawXRTest {
     if (s.mode === 'mesh' && s.mesh && this.videoEl) {
       const controls = this.getControls();
       const depth = currentDepth ?? this.getPlaceholderDepth();
+      const projection = getProjectionCalibration(
+        this.calibration,
+        controls,
+        depth.width / depth.height
+      );
+      const effective = getEffectiveGeometryControls(
+        controls,
+        projection.depthMetricScale
+      );
 
       // Rebuild mesh if aspect/triangle target changed mid-session
       s.mesh = this.ensureMeshResources(gl, depth, controls, s.mesh);
-      this.uploadDepthTexture(gl, s.mesh.depthTex, depth);
-      this.uploadVideoTexture(gl, s.mesh.videoTex, this.videoEl);
+      if (depth.timestampMs !== this.lastUploadedDepthTimestamp) {
+        this.uploadDepthTexture(gl, s.mesh.depthTex, depth);
+        this.lastUploadedDepthTimestamp = depth.timestampMs;
+      }
+      const videoFrame =
+        this.videoEl.getVideoPlaybackQuality?.().totalVideoFrames ??
+        Math.floor(this.videoEl.currentTime * 1000);
+      if (videoFrame !== this.lastUploadedVideoFrame) {
+        this.uploadVideoTexture(gl, s.mesh.videoTex, this.videoEl);
+        this.lastUploadedVideoFrame = videoFrame;
+      }
       // model matrix is maintained in updateFromControllers (orbit/pan/zoom)
       const model = this.meshModel.clone();
 
@@ -565,14 +613,23 @@ export class RawXRTest {
         gl.useProgram(s.mesh.prog);
         gl.uniformMatrix4fv(s.mesh.uniforms.viewProj, false, viewProj.elements as unknown as Float32List);
         gl.uniformMatrix4fv(s.mesh.uniforms.model, false, model.elements as unknown as Float32List);
-        gl.uniform1f(s.mesh.uniforms.aspect, depth.width / depth.height);
-        gl.uniform1f(s.mesh.uniforms.zScale, controls.zScale);
-        gl.uniform1f(s.mesh.uniforms.zBias, controls.zBias);
-        gl.uniform1f(s.mesh.uniforms.zGamma, controls.zGamma);
+        gl.uniform1f(s.mesh.uniforms.aspect, projection.displayAspect);
+        gl.uniform1f(s.mesh.uniforms.zScale, effective.zScale);
+        gl.uniform1f(s.mesh.uniforms.zBias, effective.zBias);
+        gl.uniform1f(s.mesh.uniforms.zGamma, effective.zGamma);
         gl.uniform1f(s.mesh.uniforms.zMaxClip, controls.zMaxClip);
-        gl.uniform1f(s.mesh.uniforms.planeScale, controls.planeScale);
+        gl.uniform1f(s.mesh.uniforms.planeScale, effective.planeScale);
         gl.uniform1f(s.mesh.uniforms.projectionMix, getProjectionMix(controls));
-        gl.uniform1f(s.mesh.uniforms.tanHalfSourceFovY, getTanHalfSourceFovY(controls));
+        gl.uniform2f(
+          s.mesh.uniforms.focalNorm,
+          projection.focalNormX,
+          projection.focalNormY
+        );
+        gl.uniform2f(
+          s.mesh.uniforms.principalUv,
+          projection.principalUvX,
+          projection.principalUvY
+        );
 
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, s.mesh.depthTex);
@@ -673,6 +730,7 @@ export class RawXRTest {
   private getControls(): ViewerControls {
     const fallback: ViewerControls = {
       projectionMode: 'pinhole',
+      framingMode: 'source',
       targetTriangles: 8000,
       fovY: 60,
       sourceFovY: 60,
@@ -692,7 +750,11 @@ export class RawXRTest {
     controls: ViewerControls,
     existing?: MeshState
   ): MeshState {
-    const aspect = depth.width / depth.height;
+    const aspect = getProjectionCalibration(
+      this.calibration,
+      controls,
+      depth.width / depth.height
+    ).displayAspect;
     const targetTris = controls.targetTriangles;
 
     // Create program once
@@ -711,7 +773,8 @@ export class RawXRTest {
         uniform float uZMaxClip;\n
         uniform float uPlaneScale;\n
         uniform float uProjectionMix;\n
-        uniform float uTanHalfSourceFovY;\n
+        uniform vec2 uFocalNorm;\n
+        uniform vec2 uPrincipalUv;\n
         out vec2 vUv;\n
         void main(){\n
           // Keep video座標は左→右、上→下。サンプルは上下反転のみ。
@@ -725,9 +788,8 @@ export class RawXRTest {
           float z = zDepth + uZBias;
           float reliefX = (aUv.x - 0.5) * uAspect * uPlaneScale;\n
           float reliefY = (0.5 - aUv.y) * uPlaneScale;\n
-          float pinholeSpread = (2.0 * uTanHalfSourceFovY) * (0.5 * uPlaneScale);\n
-          float pinholeX = (aUv.x - 0.5) * uAspect * pinholeSpread * z;\n
-          float pinholeY = (0.5 - aUv.y) * pinholeSpread * z;\n
+          float pinholeX = ((vUv.x - uPrincipalUv.x) / uFocalNorm.x) * z;\n
+          float pinholeY = ((vUv.y - uPrincipalUv.y) / uFocalNorm.y) * z;\n
           float x = mix(reliefX, pinholeX, uProjectionMix);\n
           float y = mix(reliefY, pinholeY, uProjectionMix);\n
           vec4 local = vec4(x, y, -z, 1.0);\n
@@ -752,7 +814,8 @@ export class RawXRTest {
         zMaxClip: gl.getUniformLocation(prog, 'uZMaxClip'),
         planeScale: gl.getUniformLocation(prog, 'uPlaneScale'),
         projectionMix: gl.getUniformLocation(prog, 'uProjectionMix'),
-        tanHalfSourceFovY: gl.getUniformLocation(prog, 'uTanHalfSourceFovY'),
+        focalNorm: gl.getUniformLocation(prog, 'uFocalNorm'),
+        principalUv: gl.getUniformLocation(prog, 'uPrincipalUv'),
       };
       gl.useProgram(prog);
       const depthLoc = gl.getUniformLocation(prog, 'uDepthTex');
@@ -873,8 +936,8 @@ export class RawXRTest {
 
   private getPlaceholderDepth(): DepthFrame {
     if (this.placeholderDepth) return this.placeholderDepth;
-    const w = this.videoEl?.videoWidth || 1920;
-    const h = this.videoEl?.videoHeight || 1080;
+    const w = this.calibration?.inferenceWidth || this.videoEl?.videoWidth || 1920;
+    const h = this.calibration?.inferenceHeight || this.videoEl?.videoHeight || 1080;
     const data = new Float32Array(w * h); // zeros => flat plane
     this.placeholderDepth = {
       timestampMs: 0,
@@ -886,6 +949,63 @@ export class RawXRTest {
       zMax: 1,
     };
     return this.placeholderDepth;
+  }
+
+  /**
+   * Anchor the reconstructed source-camera origin at the midpoint of the first
+   * valid XR viewer pose. The anchor stays fixed afterwards, so later head or
+   * Looking Glass view motion produces real parallax instead of head-locking
+   * the video surface.
+   */
+  private syncViewerSourceAnchor(
+    pose: XRViewerPose,
+    framingMode: ViewFramingMode
+  ): void {
+    if (this.xrFramingMode === framingMode) return;
+    this.xrFramingMode = framingMode;
+
+    if (framingMode !== 'source' || pose.views.length === 0) {
+      this.sourceViewBaseOrientation.identity();
+      return;
+    }
+
+    const center = new THREE.Vector3();
+    const orientation = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    const viewPosition = new THREE.Vector3();
+    const viewOrientation = new THREE.Quaternion();
+
+    pose.views.forEach((view, index) => {
+      new THREE.Matrix4()
+        .fromArray(view.transform.matrix as unknown as number[])
+        .decompose(viewPosition, viewOrientation, scale);
+      center.add(viewPosition);
+      if (index === 0) {
+        orientation.copy(viewOrientation);
+      } else {
+        if (orientation.dot(viewOrientation) < 0) {
+          viewOrientation.set(
+            -viewOrientation.x,
+            -viewOrientation.y,
+            -viewOrientation.z,
+            -viewOrientation.w
+          );
+        }
+        orientation.slerp(viewOrientation, 1 / (index + 1));
+      }
+    });
+
+    center.multiplyScalar(1 / pose.views.length);
+    this.orbitTarget.copy(center);
+    this.sourceViewBaseOrientation.copy(orientation).normalize();
+    this.orbitYaw = 0;
+    this.orbitPitch = 0;
+    this.orbitRadius = 2.0;
+    this.meshModel.compose(
+      center,
+      this.sourceViewBaseOrientation,
+      new THREE.Vector3(1, 1, 1)
+    );
   }
 
   private updateFromControllers(session: XRSession, frame: XRFrame, refSpace: XRReferenceSpace): void {
@@ -1031,13 +1151,19 @@ export class RawXRTest {
       }
     }
 
-    const model = new THREE.Matrix4()
-      .makeTranslation(this.orbitTarget.x, this.orbitTarget.y, this.orbitTarget.z)
-      .multiply(new THREE.Matrix4().makeRotationY(this.orbitYaw))
-      .multiply(new THREE.Matrix4().makeRotationX(this.orbitPitch));
-    // apply zoom as uniform scale on Z only (dolly)
-    const zoom = new THREE.Matrix4().makeScale(1, 1, this.orbitRadius / 2.0);
-    this.meshModel.copy(model.multiply(zoom));
+    const dollyZ = -(this.orbitRadius - 2.0);
+    const userRotation = new THREE.Quaternion()
+      .setFromEuler(new THREE.Euler(this.orbitPitch, this.orbitYaw, 0, 'YXZ'));
+    const orientation = this.sourceViewBaseOrientation.clone().multiply(userRotation);
+    const dolly = new THREE.Vector3(0, 0, dollyZ).applyQuaternion(orientation);
+    const position = this.orbitTarget.clone().add(dolly);
+    const model = new THREE.Matrix4().compose(
+      position,
+      orientation,
+      new THREE.Vector3(1, 1, 1)
+    );
+    // Zoom is a rigid dolly. Scaling only Z deforms calibrated metric geometry.
+    this.meshModel.copy(model);
     this.updateDebugOverlay(primary, sources.length);
   }
 

@@ -1,8 +1,7 @@
-import pako from 'pako';
 import type { DepthFrame, DepthStatus, PerfSettings } from '../types';
-import { DEPTH_HEADER_SIZE, DEPTH_MAGIC, DEPTH_MAGIC_COMPRESSED } from '../types';
 import { wsUrl } from '../utils/env';
 import { getSessionStatus } from './sessionApi';
+import { decodeDepthPacket } from './depthPacket';
 
 type DepthListener = (frame: DepthFrame) => void;
 type StatusListener = (state: { connected: boolean }) => void;
@@ -14,16 +13,23 @@ export class DepthClient {
   private inflight = 0;
   private pending: number[] = [];
   private droppedFrames = 0;
-  private lastTimestampMs = -1;
   private sessionId: string;
+  private getPerfSettings: () => PerfSettings;
+  private getAppliedFps: () => number;
   private requestTimes = new Map<number, number>();
   private rtt = 0;
   private rttAlpha = 0.1; // EMA factor
   // debug counters (currently unused)
-  private dbg = { recv: 0, droppedUnknown: 0, droppedVersion: 0, droppedOrder: 0 };
+  private dbg = { droppedUnknown: 0 };
 
-  constructor(sessionId: string, _getPerfSettings: () => PerfSettings) {
+  constructor(
+    sessionId: string,
+    getPerfSettings: () => PerfSettings,
+    getAppliedFps: () => number = () => 0
+  ) {
     this.sessionId = sessionId;
+    this.getPerfSettings = getPerfSettings;
+    this.getAppliedFps = getAppliedFps;
   }
 
   connect(): void {
@@ -45,23 +51,34 @@ export class DepthClient {
     };
     this.socket.onmessage = (event) => {
       if (typeof event.data === 'string') {
-        const payload = JSON.parse(event.data);
-        if (payload.type === 'error') {
-          console.error('Depth stream error', payload.message);
+        try {
+          const payload = JSON.parse(event.data) as {
+            type?: string;
+            message?: string;
+            time_ms?: number;
+          };
+          if (payload.type === 'error') {
+            console.error('Depth stream error', payload.message);
+          }
+          if (Number.isFinite(payload.time_ms)) {
+            this.takeRequestStart(Number(payload.time_ms));
+          } else {
+            this.decrementInflight();
+          }
+        } catch (error) {
+          console.error('Invalid depth stream message', error);
+          this.decrementInflight();
         }
-        this.decrementInflight();
         this.flushQueue();
         return;
       }
-      this.decrementInflight();
       this.updateJitter();
       const frame = this.parseDepthFrame(event.data as ArrayBuffer);
       if (frame) {
         // Calculate RTT
-        const start = this.requestTimes.get(frame.timestampMs);
-        if (start) {
+        const start = this.takeRequestStart(frame.timestampMs);
+        if (start !== null) {
           const duration = performance.now() - start;
-          this.requestTimes.delete(frame.timestampMs);
 
           // Update EMA RTT
           // Ignore initial large spikes (e.g. model loading > 2s) to prevent skewing
@@ -96,7 +113,10 @@ export class DepthClient {
         }
         this.listeners.forEach((cb) => cb(frame));
       } else {
-        // drop debug removed to avoid noisy console
+        // A binary response consumes one request even when its packet is
+        // malformed. Otherwise flow control remains saturated until the stale
+        // request watchdog fires (at least two seconds later).
+        this.decrementInflight();
       }
       this.flushQueue();
     };
@@ -114,7 +134,6 @@ export class DepthClient {
     this.pending = [];
     this.inflight = 0;
     this.droppedFrames = 0;
-    this.lastTimestampMs = -1;
     this.requestTimes.clear();
     this.rtt = 0;
     this.lastArrival = 0;
@@ -154,7 +173,15 @@ export class DepthClient {
       this.inflight += 1;
       const now = performance.now();
       this.requestTimes.set(target, now); // Record send time
-      this.socket.send(JSON.stringify({ time_ms: target }));
+      const settings = this.getPerfSettings();
+      this.socket.send(
+        JSON.stringify({
+          time_ms: target,
+          rtt: this.rtt,
+          performance_mode: settings.mode,
+          applied_fps: this.getAppliedFps(),
+        })
+      );
       if (import.meta.env.DEV) {
         // console.debug(`[DepthClient] Sent request for ${target}ms. Inflight: ${this.inflight}`);
       }
@@ -162,6 +189,8 @@ export class DepthClient {
   }
 
   public getInflightCount(): number {
+    this.pruneStaleRequests();
+    this.inflight = this.requestTimes.size;
     return this.inflight;
   }
 
@@ -226,70 +255,59 @@ export class DepthClient {
   }
 
   private decrementInflight(): void {
-    this.inflight = Math.max(0, this.inflight - 1);
+    const oldest = this.requestTimes.keys().next().value as number | undefined;
+    if (oldest !== undefined) this.requestTimes.delete(oldest);
+    this.inflight = this.requestTimes.size;
   }
 
   // debug logging removed
 
   private parseDepthFrame(buffer: ArrayBuffer): DepthFrame | null {
-    if (buffer.byteLength < DEPTH_HEADER_SIZE) return null;
-
-    const view = new DataView(buffer, 0, DEPTH_HEADER_SIZE);
-    const magic = new TextDecoder('ascii').decode(buffer.slice(0, 4));
-
-    let samples: Uint16Array;
-
-    if (magic === DEPTH_MAGIC_COMPRESSED) {
-      try {
-        const compressedData = new Uint8Array(buffer, DEPTH_HEADER_SIZE);
-        const decompressedData = pako.inflate(compressedData);
-        samples = new Uint16Array(decompressedData.buffer);
-      } catch (err) {
-        console.error('Decompression failed', err);
-        return null;
-      }
-    } else if (magic === DEPTH_MAGIC) {
-      samples = new Uint16Array(buffer, DEPTH_HEADER_SIZE);
-    } else {
+    const frame = decodeDepthPacket(buffer);
+    if (!frame) {
       this.dbg.droppedUnknown += 1;
       return null;
     }
+    // Parallel decode/inference completes out of request order by design. The
+    // playback buffer inserts by timestamp, so accepting every valid response
+    // avoids both holes and head-of-line blocking. Explicit seeks reconnect and
+    // clear the buffer in VideoDepthApp.
+    return frame;
+  }
 
-    const version = view.getUint16(4, true);
-    if (version !== 1) {
-      this.dbg.droppedVersion += 1;
+  private takeRequestStart(timestampMs: number): number | null {
+    this.pruneStaleRequests();
+    const exact = this.requestTimes.get(timestampMs);
+    if (exact !== undefined) {
+      this.requestTimes.delete(timestampMs);
+      this.inflight = this.requestTimes.size;
+      return exact;
     }
-    const timestampMs = view.getUint32(8, true);
-
-    // Discard out-of-order frames, BUT allow large backward jumps (seek/rewind)
-    // If timestamp is significantly smaller (e.g. > 500ms diff), assume it's a seek.
-    const isSeek = (this.lastTimestampMs - timestampMs) > 500;
-
-    if (timestampMs < this.lastTimestampMs && !isSeek) {
-      this.dbg.droppedOrder += 1;
-      return null;
+    let closestKey: number | null = null;
+    let closestDelta = 50;
+    for (const key of this.requestTimes.keys()) {
+      const delta = Math.abs(key - timestampMs);
+      if (delta <= closestDelta) {
+        closestKey = key;
+        closestDelta = delta;
+      }
     }
-    this.lastTimestampMs = timestampMs;
+    if (closestKey === null) return null;
+    const start = this.requestTimes.get(closestKey) ?? null;
+    this.requestTimes.delete(closestKey);
+    this.inflight = this.requestTimes.size;
+    return start;
+  }
 
-    const width = view.getUint32(12, true);
-    const height = view.getUint32(16, true);
-    const scale = view.getFloat32(20, true);
-    const bias = view.getFloat32(24, true);
-    const zMax = view.getFloat32(28, true);
-
-    const data = new Float32Array(samples.length);
-    for (let i = 0; i < samples.length; i += 1) {
-      data[i] = samples[i] * scale + bias;
+  private pruneStaleRequests(): void {
+    const timeoutMs = Math.max(2_000, this.rtt * 2 + 500);
+    const cutoff = performance.now() - timeoutMs;
+    for (const [timestamp, sentAt] of this.requestTimes) {
+      if (sentAt < cutoff) {
+        this.requestTimes.delete(timestamp);
+      }
     }
-    return {
-      timestampMs,
-      width,
-      height,
-      data,
-      scale,
-      bias,
-      zMax,
-    };
+    this.inflight = this.requestTimes.size;
   }
 
   async getStats(): Promise<DepthStatus | null> {
