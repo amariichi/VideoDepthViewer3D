@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+
+def _default_inference_worker_count(platform: str | None = None) -> int:
+    """Use a conservative default under Windows' WDDM scheduler."""
+
+    return 2 if (platform or sys.platform) == "win32" else 3
 
 
 class Settings(BaseSettings):
@@ -41,7 +48,10 @@ class Settings(BaseSettings):
         validation_alias="VIDEO_DEPTH_OPTIMIZATION_MODE",
     )
     uv_cache_dir: Path | None = None
-    inference_worker_count: int = Field(default=3, validation_alias="VIDEO_DEPTH_INFER_WORKERS")
+    inference_worker_count: int = Field(
+        default_factory=_default_inference_worker_count,
+        validation_alias="VIDEO_DEPTH_INFER_WORKERS",
+    )
     decoder_worker_count: int = Field(default=4, validation_alias="VIDEO_DEPTH_DECODER_WORKERS")
     log_level: str = Field(default="WARNING", validation_alias="VIDEO_DEPTH_LOG_LEVEL")
     clear_cache_override: bool = Field(default=False, validation_alias="VIDEO_DEPTH_CLEAR_CACHE")

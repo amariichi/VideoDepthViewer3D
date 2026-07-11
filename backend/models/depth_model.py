@@ -6,7 +6,7 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from PIL import Image
@@ -41,6 +41,19 @@ class AsyncDepthPrediction:
     slot_wait_s: float
     execution_s: float
     cold_start: bool
+
+
+class _SingleImageInputProcessor:
+    """Avoid DA3's per-call thread pool when preprocessing one image."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    def __call__(self, image: list[Any], *args: Any, **kwargs: Any) -> Any:
+        if len(image) == 1:
+            kwargs.setdefault("num_workers", 1)
+            kwargs.setdefault("sequential", True)
+        return self._delegate(image, *args, **kwargs)
 
 
 class DepthModel:
@@ -92,6 +105,12 @@ class DepthModel:
                 cache_dir=str(self.cache_dir),
             )
             self._model = model.to(self.device).eval()
+            input_processor = getattr(self._model, "input_processor", None)
+            if input_processor is not None and not isinstance(
+                input_processor,
+                _SingleImageInputProcessor,
+            ):
+                self._model.input_processor = _SingleImageInputProcessor(input_processor)
             return self._model
 
     async def infer_depth_async(

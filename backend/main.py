@@ -4,6 +4,15 @@ from __future__ import annotations
 
 import os
 
+# Depth Anything 3 snapshots this environment variable when its logger module is
+# imported. Set the quiet default before importing backend routers, which load
+# the inference package. An explicit user setting (for example INFO) still wins.
+os.environ.setdefault("DA3_LOG_LEVEL", "WARN")
+if os.name == "nt":
+    # Official Windows xFormers wheels provide CUDA operators without Triton.
+    # Avoid a noisy handled traceback while keeping an explicit user override.
+    os.environ.setdefault("XFORMERS_FORCE_DISABLE_TRITON", "1")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,8 +21,6 @@ from backend.config import get_settings
 from backend.routers import session as session_router
 from backend.routers import stream as stream_router
 from backend.video.session import get_session_manager
-
-os.environ["DA3_LOG_LEVEL"] = "WARN"
 
 
 def create_app() -> FastAPI:
