@@ -70,4 +70,4 @@ jobs:
         run: python3 -m compileall -q backend scripts tests
 
       - name: Backend tests
-        run: uv run --locked --extra dev pytest -q
+        run: uv run --locked --extra dev --extra inference pytest -q
