@@ -10,6 +10,113 @@ export interface SourceViewLayout {
   modelZ: number;
 }
 
+export interface SourceViewNavigation {
+  zoom: number;
+  panX: number;
+  panY: number;
+}
+
+export const SOURCE_VIEW_ZOOM_RANGE = { min: 0.5, max: 4 } as const;
+export const SOURCE_VIEW_MAX_PAN = 3;
+
+export function getDefaultSourceViewNavigation(): SourceViewNavigation {
+  return { zoom: 1, panX: 0, panY: 0 };
+}
+
+export function clampSourceViewNavigation(
+  navigation: SourceViewNavigation
+): SourceViewNavigation {
+  return {
+    zoom: Number.isFinite(navigation.zoom)
+      ? Math.min(
+          Math.max(navigation.zoom, SOURCE_VIEW_ZOOM_RANGE.min),
+          SOURCE_VIEW_ZOOM_RANGE.max
+        )
+      : 1,
+    panX: Number.isFinite(navigation.panX)
+      ? Math.min(
+          Math.max(navigation.panX, -SOURCE_VIEW_MAX_PAN),
+          SOURCE_VIEW_MAX_PAN
+        )
+      : 0,
+    panY: Number.isFinite(navigation.panY)
+      ? Math.min(
+          Math.max(navigation.panY, -SOURCE_VIEW_MAX_PAN),
+          SOURCE_VIEW_MAX_PAN
+        )
+      : 0,
+  };
+}
+
+/** Apply a crop-like view zoom without changing source-camera calibration. */
+export function getSourceViewZoomFovY(
+  autoFitFovY: number,
+  zoom: number
+): number {
+  const safeFov = Number.isFinite(autoFitFovY)
+    ? Math.min(Math.max(autoFitFovY, 1), 170)
+    : 50;
+  const safeZoom = clampSourceViewNavigation({
+    zoom,
+    panX: 0,
+    panY: 0,
+  }).zoom;
+  return Math.min(
+    Math.max(
+      (2 * Math.atan(Math.tan((safeFov * Math.PI) / 360) / safeZoom) *
+        180) /
+        Math.PI,
+      1
+    ),
+    170
+  );
+}
+
+/** Zoom around one normalized viewport point while retaining its screen spot. */
+export function zoomSourceViewAt(
+  navigation: SourceViewNavigation,
+  deltaY: number,
+  cursorX = 0,
+  cursorY = 0
+): SourceViewNavigation {
+  const current = clampSourceViewNavigation(navigation);
+  const safeDelta = Number.isFinite(deltaY)
+    ? Math.min(Math.max(deltaY, -500), 500)
+    : 0;
+  const zoom = Math.min(
+    Math.max(
+      current.zoom * Math.exp(-safeDelta * 0.0015),
+      SOURCE_VIEW_ZOOM_RANGE.min
+    ),
+    SOURCE_VIEW_ZOOM_RANGE.max
+  );
+  const scale = zoom / current.zoom;
+  const anchorX = Number.isFinite(cursorX)
+    ? Math.min(Math.max(cursorX, -1), 1)
+    : 0;
+  const anchorY = Number.isFinite(cursorY)
+    ? Math.min(Math.max(cursorY, -1), 1)
+    : 0;
+  return clampSourceViewNavigation({
+    zoom,
+    panX: anchorX - scale * (anchorX - current.panX),
+    panY: anchorY - scale * (anchorY - current.panY),
+  });
+}
+
+export function panSourceViewBy(
+  navigation: SourceViewNavigation,
+  deltaX: number,
+  deltaY: number
+): SourceViewNavigation {
+  const current = clampSourceViewNavigation(navigation);
+  return clampSourceViewNavigation({
+    ...current,
+    panX: current.panX + (Number.isFinite(deltaX) ? deltaX : 0),
+    panY: current.panY + (Number.isFinite(deltaY) ? deltaY : 0),
+  });
+}
+
 export const DEFAULT_SOURCE_PIVOT_DEPTH = 3.5;
 export const MIN_SOURCE_PIVOT_DEPTH = 0.2;
 export const MAX_SOURCE_PIVOT_DEPTH = 50;

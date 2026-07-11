@@ -18,8 +18,13 @@ import { fragmentShader, vertexShader } from './shaders';
 import {
   DEFAULT_SOURCE_PIVOT_DEPTH,
   estimateSourcePivotDepth,
+  getDefaultSourceViewNavigation,
   getSourceViewFitFovY,
   getSourceViewLayout,
+  getSourceViewZoomFovY,
+  panSourceViewBy,
+  zoomSourceViewAt,
+  type SourceViewNavigation,
 } from './sourceView';
 import { perfStats } from '../utils/perfStats';
 
@@ -71,6 +76,8 @@ export class RenderScene {
   private latestDepthFrame: DepthFrame | null = null;
   private sourcePivotDepth = DEFAULT_SOURCE_PIVOT_DEPTH;
   private sourceFitFovY = 50;
+  private sourceViewNavigation: SourceViewNavigation =
+    getDefaultSourceViewNavigation();
   private sourcePivotInitialized = false;
   private lastSourcePivotUpdateMs = 0;
 
@@ -257,6 +264,8 @@ export class RenderScene {
     minimumViewFovY: number;
     viewportAspect: number;
     sbsEnabled: boolean;
+    sourceViewZoom: number;
+    sourceViewPan: [number, number];
   } {
     const cameraPosition: [number, number, number] = this.camera.position.toArray();
     const meshSourceOrigin = this.mesh
@@ -276,6 +285,11 @@ export class RenderScene {
       minimumViewFovY: this.currentControls.fovY,
       viewportAspect: this.getSourceViewViewportAspect(),
       sbsEnabled: this.sbsEnabled,
+      sourceViewZoom: this.sourceViewNavigation.zoom,
+      sourceViewPan: [
+        this.sourceViewNavigation.panX,
+        this.sourceViewNavigation.panY,
+      ],
     };
   }
 
@@ -343,6 +357,9 @@ export class RenderScene {
     const enteredSourceView =
       previousControls.framingMode !== 'source' &&
       this.currentControls.framingMode === 'source';
+    if (enteredSourceView) {
+      this.sourceViewNavigation = getDefaultSourceViewNavigation();
+    }
     if (!this.isSourceViewActive()) {
       this.camera.fov = this.currentControls.fovY;
       this.camera.updateProjectionMatrix();
@@ -387,6 +404,7 @@ export class RenderScene {
     this.calibration = calibration;
     this.latestDepthFrame = null;
     this.sourcePivotDepth = DEFAULT_SOURCE_PIVOT_DEPTH;
+    this.sourceViewNavigation = getDefaultSourceViewNavigation();
     this.sourcePivotInitialized = false;
     this.lastSourcePivotUpdateMs = 0;
     const projection = getProjectionCalibration(
@@ -562,8 +580,28 @@ export class RenderScene {
       this.camera.position.distanceTo(this.orbitTarget),
       this.camera.near + 0.01
     );
-    this.applyOffAxisProjection(this.sbsLeftCam, -this.ipd / 2, stereoAspect, convergence);
-    this.applyOffAxisProjection(this.sbsRightCam, this.ipd / 2, stereoAspect, convergence);
+    const sourcePanX = this.isSourceViewActive()
+      ? this.sourceViewNavigation.panX
+      : 0;
+    const sourcePanY = this.isSourceViewActive()
+      ? this.sourceViewNavigation.panY
+      : 0;
+    this.applyOffAxisProjection(
+      this.sbsLeftCam,
+      -this.ipd / 2,
+      stereoAspect,
+      convergence,
+      sourcePanX,
+      sourcePanY
+    );
+    this.applyOffAxisProjection(
+      this.sbsRightCam,
+      this.ipd / 2,
+      stereoAspect,
+      convergence,
+      sourcePanX,
+      sourcePanY
+    );
 
     this.renderer.setScissorTest(true);
 
@@ -587,7 +625,9 @@ export class RenderScene {
     camera: THREE.PerspectiveCamera,
     eyeOffset: number,
     aspect: number,
-    convergence: number
+    convergence: number,
+    viewPanX = 0,
+    viewPanY = 0
   ): void {
     const frustum = getOffAxisFrustum(
       camera.fov,
@@ -595,7 +635,9 @@ export class RenderScene {
       camera.near,
       camera.far,
       eyeOffset,
-      convergence
+      convergence,
+      viewPanX,
+      viewPanY
     );
     camera.aspect = aspect;
     camera.projectionMatrix.makePerspective(
@@ -616,6 +658,7 @@ export class RenderScene {
 
   public resetView(): void {
     this.currentControls = { ...this.currentControls, framingMode: 'source' };
+    this.sourceViewNavigation = getDefaultSourceViewNavigation();
     this.applySourceView(this.latestDepthFrame, !this.sourcePivotInitialized);
     this.framingModeChangeHandler?.('source');
   }
@@ -758,9 +801,19 @@ export class RenderScene {
       this.currentControls.fovY,
       this.sbsEnabled ? 1.03 : 1
     );
-    this.camera.fov = this.sourceFitFovY;
+    this.camera.fov = getSourceViewZoomFovY(
+      this.sourceFitFovY,
+      this.sourceViewNavigation.zoom
+    );
     this.camera.aspect = this.aspectRatio();
-    this.camera.updateProjectionMatrix();
+    this.applyOffAxisProjection(
+      this.camera,
+      0,
+      this.camera.aspect,
+      this.sourcePivotDepth,
+      this.sourceViewNavigation.panX,
+      this.sourceViewNavigation.panY
+    );
     this.camera.lookAt(this.orbitTarget);
     this.applyMeshPlacement(false);
 
@@ -777,24 +830,53 @@ export class RenderScene {
     return this.sbsEnabled ? combinedAspect / 2 : combinedAspect;
   }
 
+  private getSourceViewPointerNdc(
+    clientX: number,
+    clientY: number
+  ): { x: number; y: number } {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const viewportWidth = Math.max(
+      this.sbsEnabled ? rect.width / 2 : rect.width,
+      1
+    );
+    const localX = this.sbsEnabled
+      ? ((clientX - rect.left) % viewportWidth + viewportWidth) % viewportWidth
+      : clientX - rect.left;
+    return {
+      x: THREE.MathUtils.clamp((2 * localX) / viewportWidth - 1, -1, 1),
+      y: THREE.MathUtils.clamp(
+        1 - (2 * (clientY - rect.top)) / Math.max(rect.height, 1),
+        -1,
+        1
+      ),
+    };
+  }
+
   private attachMouseOrbitControls(): void {
     const dom = this.renderer.domElement;
     let dragging = false;
     let lastX = 0;
     let lastY = 0;
     let isPanning = false;
+    let sourceViewPanning = false;
 
     dom.addEventListener('contextmenu', (e) => e.preventDefault());
 
     dom.addEventListener('mousedown', (e) => {
-      this.enterFreeOrbit();
       dragging = true;
-      isPanning = e.button === 2; // right button = pan, left button = orbit
+      sourceViewPanning = this.isSourceViewActive();
+      if (!sourceViewPanning) {
+        this.enterFreeOrbit();
+        isPanning = e.button === 2; // right button = pan, left button = orbit
+      } else {
+        isPanning = false;
+      }
       lastX = e.clientX;
       lastY = e.clientY;
     });
     window.addEventListener('mouseup', () => {
       dragging = false;
+      sourceViewPanning = false;
     });
     dom.addEventListener('mousemove', (e) => {
       if (!dragging) return;
@@ -803,7 +885,19 @@ export class RenderScene {
       lastX = e.clientX;
       lastY = e.clientY;
 
-      if (isPanning) {
+      if (sourceViewPanning && this.isSourceViewActive()) {
+        const rect = dom.getBoundingClientRect();
+        const viewportWidth = Math.max(
+          this.sbsEnabled ? rect.width / 2 : rect.width,
+          1
+        );
+        this.sourceViewNavigation = panSourceViewBy(
+          this.sourceViewNavigation,
+          (2 * dx) / viewportWidth,
+          (-2 * dy) / Math.max(rect.height, 1)
+        );
+        this.applySourceView(this.latestDepthFrame, false);
+      } else if (isPanning) {
         const scale = this.orbitRadius * 0.002;
         const pan = new THREE.Vector3();
         const dir = new THREE.Vector3();
@@ -824,6 +918,23 @@ export class RenderScene {
     });
     dom.addEventListener('wheel', (e) => {
       e.preventDefault();
+      if (this.isSourceViewActive()) {
+        const rect = dom.getBoundingClientRect();
+        const deltaScale = e.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? 16
+          : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? Math.max(rect.height, 1)
+            : 1;
+        const cursor = this.getSourceViewPointerNdc(e.clientX, e.clientY);
+        this.sourceViewNavigation = zoomSourceViewAt(
+          this.sourceViewNavigation,
+          e.deltaY * deltaScale,
+          cursor.x,
+          cursor.y
+        );
+        this.applySourceView(this.latestDepthFrame, false);
+        return;
+      }
       this.enterFreeOrbit();
       this.orbitRadius = this.clampViewDistance(this.orbitRadius + e.deltaY * 0.002);
       this.updateCameraOrbit();
@@ -845,7 +956,11 @@ export class RenderScene {
       this.mesh.position.set(this.xrTarget.x, this.xrTarget.y + this.vrYOffset, this.xrTarget.z);
       return;
     }
-    this.mesh.position.set(0, this.currentControls.yOffset, this.modelZOffset);
+    this.mesh.position.set(
+      0,
+      this.currentControls.yOffset,
+      this.modelZOffset
+    );
   }
 
   async endXR(): Promise<void> {

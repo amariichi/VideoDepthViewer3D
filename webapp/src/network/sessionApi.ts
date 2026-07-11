@@ -1,6 +1,28 @@
 import type { CameraCalibration, DepthStatus, SessionInfo } from '../types';
 import { apiUrl } from '../utils/env';
 
+export const VIDEO_TRANSFER_STATUS =
+  'Transferring video to the processing backend...';
+
+export function describeVideoTransferError(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  return 'Could not create the processing session. Please try again.';
+}
+
+async function backendErrorDetail(res: Response): Promise<string> {
+  try {
+    const payload = (await res.json()) as { detail?: unknown };
+    if (typeof payload.detail === 'string' && payload.detail.trim()) {
+      return `: ${payload.detail.trim()}`;
+    }
+  } catch {
+    // The HTTP status below remains actionable when the body is not JSON.
+  }
+  return '';
+}
+
 function fallbackCalibration(
   width: number,
   height: number,
@@ -68,12 +90,24 @@ function parseCalibration(
 export async function uploadVideo(file: File): Promise<SessionInfo> {
   const body = new FormData();
   body.append('file', file);
-  const res = await fetch(apiUrl('/api/sessions'), {
-    method: 'POST',
-    body,
-  });
+  let res: Response;
+  try {
+    res = await fetch(apiUrl('/api/sessions'), {
+      method: 'POST',
+      body,
+    });
+  } catch (cause) {
+    throw new Error(
+      'Cannot reach the processing backend. Make sure ./start.sh is still running.',
+      { cause }
+    );
+  }
   if (!res.ok) {
-    throw new Error(`Failed to create session: ${res.statusText}`);
+    const detail = await backendErrorDetail(res);
+    const status = res.statusText
+      ? `${res.status} ${res.statusText}`
+      : String(res.status);
+    throw new Error(`Processing backend rejected the video (${status})${detail}`);
   }
   const data = await res.json();
   const width = Number(data.width);
@@ -139,9 +173,14 @@ export async function getSessionStatus(sessionId: string): Promise<DepthStatus> 
     rolling_stats: data.rolling_stats ?? {
       depth_fps: 0,
       latency_ms: 0,
+      client_fps: 0,
       infer_avg_s: 0,
+      infer_wait_avg_s: 0,
+      normalize_avg_s: 0,
+      pack_avg_s: 0,
       queue_avg_s: 0,
       ws_send_avg_s: 0,
+      decode_avg_s: 0,
       payload_avg_bytes: 0,
       drop_count: 0,
     },

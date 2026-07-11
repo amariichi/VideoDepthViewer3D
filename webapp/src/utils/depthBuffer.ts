@@ -67,6 +67,28 @@ export class DepthBuffer {
         return bestFrame;
     }
 
+    getFramesNear(
+        timeMs: number,
+        maxDistanceMs = 1000,
+        maxFrames = 7
+    ): DepthFrame[] {
+        if (!Number.isFinite(timeMs)) return [];
+        const distance = Number.isFinite(maxDistanceMs)
+            ? Math.max(maxDistanceMs, 0)
+            : 1000;
+        const limit = Number.isFinite(maxFrames)
+            ? Math.max(1, Math.floor(maxFrames))
+            : 7;
+        return this.frames
+            .filter((frame) => Math.abs(frame.timestampMs - timeMs) <= distance)
+            .sort(
+                (a, b) =>
+                    Math.abs(a.timestampMs - timeMs) -
+                    Math.abs(b.timestampMs - timeMs)
+            )
+            .slice(0, limit);
+    }
+
     getMissing(startMs: number, endMs: number, stepMs: number, timeoutMs: number): number[] {
         const missing: number[] = [];
         const now = performance.now();

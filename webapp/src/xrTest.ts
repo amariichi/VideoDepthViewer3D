@@ -13,9 +13,50 @@ import {
   getProjectionCalibration,
   getProjectionMix,
 } from './render/projection';
+import { getGridSegments } from './render/mesh';
+import {
+  FRONT_SAFETY_SAMPLE_INTERVAL_MS,
+  LOOKING_GLASS_AUTO_REBASE_NEAR_QUANTILE,
+  LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE,
+  LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS,
+  LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_RATE,
+  LOOKING_GLASS_AUTO_CONVERGENCE_FRONT_QUANTILE,
+  LOOKING_GLASS_AUTO_CONVERGENCE_NORMAL_RESPONSE_RATE,
+  LOOKING_GLASS_AUTO_CONVERGENCE_SAMPLE_INTERVAL_MS,
+  LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS,
+  AutoConvergenceController,
+  FrontSafetyController,
+  LOOKING_GLASS_LATER_INCREASE_CONFIRMATION_SAMPLES,
+  classifyLookingGlassAutoConvergence,
+  estimateRenderedDepthQuantiles,
+  estimateRenderedNearDepth,
+  getLookingGlassAutoConvergenceTarget,
+  getLookingGlassRequiredPushback,
+  getLookingGlassSourceDepthScaleRebase,
+  getLookingGlassSourceNearClipRebase,
+  getWebXRRequiredPushback,
+  type XRFrontSafetyProfile,
+} from './render/frontSafety';
+import { DEFAULT_LOOKING_GLASS_FOV_Y } from './lookingGlass';
+import {
+  pickLookingGlassDepthMesh,
+  type LookingGlassDepthPick,
+  type LookingGlassDepthPickInput,
+} from './lookingGlassInteraction';
 import { DepthBuffer } from './utils/depthBuffer';
+import { perfStats } from './utils/perfStats';
 
 export type RawXRMode = 'quad' | 'mesh' | 'three';
+
+export const LOOKING_GLASS_XR_DEPTH_NEAR = 0.01;
+
+export function getXRSessionDepthNear(
+  profile: XRFrontSafetyProfile
+): number | undefined {
+  return profile.mode === 'looking-glass'
+    ? LOOKING_GLASS_XR_DEPTH_NEAR
+    : undefined;
+}
 
 interface DepthMeshReadiness {
   desiredMode: RawXRMode;
@@ -42,6 +83,208 @@ export function shouldInitializeDepthMesh({
     (currentMode !== 'mesh' || !hasMesh) &&
     hasDepth &&
     hasVideo
+  );
+}
+
+/** Uniformly scale source geometry around its apex without moving that apex. */
+export function scaleModelAboutSourceApex(
+  model: THREE.Matrix4,
+  scaleFactor: number
+): THREE.Matrix4 {
+  const safeScale = Number.isFinite(scaleFactor) && scaleFactor > 0
+    ? scaleFactor
+    : 1;
+  return model.clone().scale(
+    new THREE.Vector3(safeScale, safeScale, safeScale)
+  );
+}
+
+/**
+ * Return only XR-owned state to the polyfill at the end of an application
+ * frame. @lookingglass/webxr 0.6.0 preserves SCISSOR_TEST around its final
+ * fullscreen quilt blit but does not disable it for that draw. Leaving the last
+ * quilt tile's scissor active can therefore clip the entire display output.
+ */
+export function releaseXRPresentationState(
+  gl: Pick<WebGL2RenderingContext, 'disable' | 'SCISSOR_TEST'>
+): void {
+  gl.disable(gl.SCISSOR_TEST);
+}
+
+export function shouldUseLookingGlassFixedSourceProjection(
+  profile: XRFrontSafetyProfile,
+  controls: Pick<ViewerControls, 'projectionMode' | 'framingMode'>
+): boolean {
+  return (
+    profile.mode === 'looking-glass' &&
+    profile.preserveSourceProjection === true &&
+    controls.projectionMode === 'pinhole' &&
+    controls.framingMode === 'source'
+  );
+}
+
+/**
+ * Uniformly shrink clip X/Y without moving XR cameras or deforming the mesh.
+ * This is equivalent to a wider content FOV, but leaves the vendor's physical
+ * camera FOV, near/far setup, and zero-parallax controls untouched.
+ */
+export function scaleXRProjectionForSourceFit(
+  projection: THREE.Matrix4,
+  scale: number,
+  panX = 0,
+  panY = 0
+): THREE.Matrix4 {
+  const safeScale = Number.isFinite(scale)
+    ? Math.min(Math.max(scale, 0.025), 4)
+    : 1;
+  const safePanX = Number.isFinite(panX)
+    ? Math.min(Math.max(panX, -2), 2)
+    : 0;
+  const safePanY = Number.isFinite(panY)
+    ? Math.min(Math.max(panY, -2), 2)
+    : 0;
+  if (safeScale === 1 && safePanX === 0 && safePanY === 0) {
+    return projection.clone();
+  }
+  const scaleMatrix = new THREE.Matrix4().makeScale(
+    safeScale,
+    safeScale,
+    1
+  );
+  return new THREE.Matrix4()
+    .makeTranslation(safePanX, safePanY, 0)
+    .multiply(scaleMatrix)
+    .multiply(projection);
+}
+
+export const LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE = {
+  min: 0.25,
+  max: 2,
+} as const;
+
+export interface LookingGlassConvergenceTargetClamp {
+  targetZ: number;
+  limited: boolean;
+  baselineLimited: boolean;
+  foregroundLimited: boolean;
+  sourceRebased?: boolean;
+}
+
+/**
+ * Keep a manual zero-parallax request reachable without moving the vendor
+ * center camera. With automatic safety enabled, also prevent the current 20%
+ * depth boundary from starting in front of the requested target.
+ */
+export function clampLookingGlassConvergenceTarget(
+  cameraCenterZ: number,
+  configuredTargetZ: number,
+  requestedTargetZ: number,
+  crowdedBoundaryZ: number | null = null
+): LookingGlassConvergenceTargetClamp {
+  if (
+    !Number.isFinite(cameraCenterZ) ||
+    !Number.isFinite(configuredTargetZ) ||
+    !Number.isFinite(requestedTargetZ)
+  ) {
+    return {
+      targetZ: Number.isFinite(configuredTargetZ) ? configuredTargetZ : 0,
+      limited: true,
+      baselineLimited: true,
+      foregroundLimited: false,
+    };
+  }
+  const configuredDistance = cameraCenterZ - configuredTargetZ;
+  if (configuredDistance <= 0.05) {
+    return {
+      targetZ: configuredTargetZ,
+      limited: Math.abs(requestedTargetZ - configuredTargetZ) > 1e-6,
+      baselineLimited: true,
+      foregroundLimited: false,
+    };
+  }
+
+  const baselineFarLimit =
+    cameraCenterZ -
+    LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE.max *
+      configuredDistance;
+  const nearLimit =
+    cameraCenterZ -
+    LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE.min *
+      configuredDistance;
+  const hasForegroundLimit =
+    crowdedBoundaryZ !== null && Number.isFinite(crowdedBoundaryZ);
+  const foregroundFarLimit = hasForegroundLimit
+    ? Math.min(crowdedBoundaryZ as number, nearLimit)
+    : baselineFarLimit;
+  const farLimit = Math.max(baselineFarLimit, foregroundFarLimit);
+  const targetZ = Math.min(Math.max(requestedTargetZ, farLimit), nearLimit);
+  const baselineLimited =
+    requestedTargetZ < baselineFarLimit || requestedTargetZ > nearLimit;
+  const foregroundLimited =
+    hasForegroundLimit && requestedTargetZ < foregroundFarLimit;
+
+  return {
+    targetZ,
+    limited: Math.abs(targetZ - requestedTargetZ) > 1e-6,
+    baselineLimited,
+    foregroundLimited,
+  };
+}
+
+export function getLookingGlassConvergenceBaselineScale(
+  cameraCenterZ: number,
+  currentTargetZ: number,
+  effectiveTargetZ: number
+): number {
+  if (
+    !Number.isFinite(cameraCenterZ) ||
+    !Number.isFinite(currentTargetZ) ||
+    !Number.isFinite(effectiveTargetZ)
+  ) {
+    return 1;
+  }
+  const currentDistance = cameraCenterZ - currentTargetZ;
+  const effectiveDistance = cameraCenterZ - effectiveTargetZ;
+  if (currentDistance <= 0.05 || effectiveDistance <= 0.05) return 1;
+  return Math.min(
+    Math.max(
+      effectiveDistance / currentDistance,
+      LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE.min
+    ),
+    LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE.max
+  );
+}
+
+/** Scale only the multi-view camera baseline around the fixed center view. */
+export function scaleXRViewBaseline(
+  viewMatrix: THREE.Matrix4,
+  centerViewMatrix: THREE.Matrix4,
+  scale: number
+): THREE.Matrix4 {
+  const safeScale = Number.isFinite(scale)
+    ? Math.min(
+        Math.max(
+          scale,
+          LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE.min
+        ),
+        LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE.max
+      )
+    : 1;
+  if (safeScale === 1) return viewMatrix.clone();
+  const viewPosition = new THREE.Vector3();
+  const viewOrientation = new THREE.Quaternion();
+  const viewScale = new THREE.Vector3();
+  const centerPosition = new THREE.Vector3();
+  viewMatrix.decompose(viewPosition, viewOrientation, viewScale);
+  centerPosition.setFromMatrixPosition(centerViewMatrix);
+  viewPosition
+    .sub(centerPosition)
+    .multiplyScalar(safeScale)
+    .add(centerPosition);
+  return new THREE.Matrix4().compose(
+    viewPosition,
+    viewOrientation,
+    viewScale
   );
 }
 
@@ -131,6 +374,10 @@ export class RawXRTest {
   private calibration: CameraCalibration | null = null;
   private depthBuffer: DepthBuffer | null = null;
   private lastRenderedDepthFrame: DepthFrame | null = null;
+  private latestLookingGlassPickContext: Omit<
+    LookingGlassDepthPickInput,
+    'normalizedX' | 'normalizedY'
+  > | null = null;
   private meshModel: THREE.Matrix4 = new THREE.Matrix4();
   private orbitYaw = 0;
   private orbitPitch = 0;
@@ -146,6 +393,17 @@ export class RawXRTest {
   private placeholderDepth: DepthFrame | null = null;
   private lastUploadedDepthTimestamp = -1;
   private lastUploadedVideoFrame = -1;
+  private frontSafetyProfile: XRFrontSafetyProfile = { mode: 'webxr' };
+  private readonly frontSafety = new FrontSafetyController();
+  private readonly autoConvergence = new AutoConvergenceController();
+  private autoConvergencePausedUntilMs = 0;
+  private autoConvergenceFastUntilMs = 0;
+  private lastAutoConvergenceFrontBoundaryZ: number | null = null;
+  private lastAutoConvergenceDepthTimestamp = -1;
+  private lookingGlassSourceDepthScale = 1;
+  private lastLookingGlassSourceDepthRebaseTimestamp = -1;
+  private lastFrontSafetySampleMs = 0;
+  private lastFrontSafetyFrameMs = 0;
   private hintCanvas: HTMLCanvasElement;
   private hintCtx: CanvasRenderingContext2D | null;
   private hintTimeout: number | null = null;
@@ -211,12 +469,250 @@ export class RawXRTest {
   setDepthBuffer(buffer: DepthBuffer): void {
     this.depthBuffer = buffer;
     this.lastRenderedDepthFrame = null;
+    this.latestLookingGlassPickContext = null;
     this.lastUploadedDepthTimestamp = -1;
     this.lastUploadedVideoFrame = -1;
+    this.frontSafety.reset();
+    this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
+    this.autoConvergencePausedUntilMs = 0;
+    this.autoConvergenceFastUntilMs = 0;
+    this.lastAutoConvergenceFrontBoundaryZ = null;
+    this.lastAutoConvergenceDepthTimestamp = -1;
+    this.lookingGlassSourceDepthScale = 1;
+    this.lastLookingGlassSourceDepthRebaseTimestamp = -1;
+    this.lastFrontSafetySampleMs = 0;
+    this.lastFrontSafetyFrameMs = 0;
+  }
+
+  setFrontSafetyProfile(profile: XRFrontSafetyProfile): void {
+    const targetChanged =
+      profile.targetZ !== this.frontSafetyProfile.targetZ;
+    const autoContextChanged =
+      profile.mode !== this.frontSafetyProfile.mode ||
+      profile.preserveSourceProjection !==
+        this.frontSafetyProfile.preserveSourceProjection ||
+      profile.autoConvergence !== this.frontSafetyProfile.autoConvergence;
+    if (autoContextChanged || (profile.autoConvergence === true && targetChanged)) {
+      this.frontSafety.reset();
+      this.autoConvergence.reset(profile.targetZ);
+      this.autoConvergenceFastUntilMs = 0;
+      if (autoContextChanged) {
+        this.autoConvergencePausedUntilMs = 0;
+        this.lastAutoConvergenceFrontBoundaryZ = null;
+        this.lastAutoConvergenceDepthTimestamp = -1;
+        this.lastLookingGlassSourceDepthRebaseTimestamp = -1;
+      }
+      this.lastFrontSafetySampleMs = 0;
+      this.lastFrontSafetyFrameMs = 0;
+    }
+    this.frontSafetyProfile = { ...profile };
+  }
+
+  refitFrontSafety(): void {
+    this.frontSafety.reset();
+    this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
+    this.autoConvergencePausedUntilMs = 0;
+    this.autoConvergenceFastUntilMs = 0;
+    this.lastAutoConvergenceFrontBoundaryZ = null;
+    this.lastAutoConvergenceDepthTimestamp = -1;
+    this.lastLookingGlassSourceDepthRebaseTimestamp = -1;
+    this.lastFrontSafetySampleMs = 0;
+    this.lastFrontSafetyFrameMs = 0;
+  }
+
+  getFrontSafetyPushback(): number {
+    return this.frontSafety.value;
+  }
+
+  getAutoConvergenceTargetZ(): number | null {
+    return this.autoConvergence.value;
+  }
+
+  getLookingGlassSourceDepthScale(): number {
+    return this.lookingGlassSourceDepthScale;
+  }
+
+  getSafeLookingGlassConvergenceTarget(
+    requestedTargetZ: number,
+    protectForeground = this.frontSafetyProfile.autoConvergence === true
+  ): LookingGlassConvergenceTargetClamp {
+    const context = this.latestLookingGlassPickContext;
+    if (!context) {
+      return {
+        targetZ: requestedTargetZ,
+        limited: false,
+        baselineLimited: false,
+        foregroundLimited: false,
+      };
+    }
+    const cameraCenterZ = new THREE.Vector3().setFromMatrixPosition(
+      context.cameraMatrixWorld
+    ).z;
+    let crowdedBoundaryZ: number | null = null;
+    if (protectForeground) {
+      const projection = getProjectionCalibration(
+        context.calibration,
+        context.controls,
+        context.frame.width / context.frame.height
+      );
+      const effective = getEffectiveGeometryControls(
+        context.controls,
+        projection.depthMetricScale
+      );
+      const depth = estimateRenderedDepthQuantiles(
+        context.frame,
+        effective,
+        context.controls.zMaxClip,
+        [LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE]
+      )?.[0];
+      if (depth !== undefined) {
+        crowdedBoundaryZ = new THREE.Vector3(0, 0, -depth)
+          .applyMatrix4(context.modelMatrix).z;
+      }
+    }
+    return clampLookingGlassConvergenceTarget(
+      cameraCenterZ,
+      this.frontSafetyProfile.targetZ ?? 0,
+      requestedTargetZ,
+      crowdedBoundaryZ
+    );
+  }
+
+  /**
+   * Resolve a manual focus request and, with Auto enabled, normalize an
+   * otherwise unreachable safe target around the fixed source apex. Auto-off
+   * retains the strict baseline clamp so an arbitrary background click cannot
+   * pull most of the scene through the display plane.
+   */
+  prepareLookingGlassConvergenceTarget(
+    requestedTargetZ: number,
+    protectForeground = this.frontSafetyProfile.autoConvergence === true
+  ): LookingGlassConvergenceTargetClamp {
+    const clamped = this.getSafeLookingGlassConvergenceTarget(
+      requestedTargetZ,
+      protectForeground
+    );
+    const context = this.latestLookingGlassPickContext;
+    if (
+      !protectForeground ||
+      !clamped.baselineLimited ||
+      !context ||
+      this.frontSafetyProfile.mode !== 'looking-glass' ||
+      this.frontSafetyProfile.preserveSourceProjection !== true
+    ) {
+      return clamped;
+    }
+
+    const projection = getProjectionCalibration(
+      context.calibration,
+      context.controls,
+      context.frame.width / context.frame.height
+    );
+    const effective = getEffectiveGeometryControls(
+      context.controls,
+      projection.depthMetricScale
+    );
+    const crowdedDepth = estimateRenderedDepthQuantiles(
+      context.frame,
+      effective,
+      context.controls.zMaxClip,
+      [LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE]
+    )?.[0];
+    if (crowdedDepth === undefined) return clamped;
+
+    const sourceOriginZ = new THREE.Vector3().setFromMatrixPosition(
+      context.modelMatrix
+    ).z;
+    const cameraCenterZ = new THREE.Vector3().setFromMatrixPosition(
+      context.cameraMatrixWorld
+    ).z;
+    const crowdedBoundaryZ = new THREE.Vector3(0, 0, -crowdedDepth)
+      .applyMatrix4(context.modelMatrix).z;
+    const foregroundLimited = requestedTargetZ < crowdedBoundaryZ;
+    const safeRequestedTargetZ = foregroundLimited
+      ? crowdedBoundaryZ
+      : requestedTargetZ;
+    const rebase = getLookingGlassSourceDepthScaleRebase({
+      sourceOriginZ,
+      cameraCenterZ,
+      configuredTargetZ: this.frontSafetyProfile.targetZ ?? 0,
+      // For a click, the q20-limited selected target is the boundary which
+      // must become reachable. Automatic all-behind recovery still uses q1.
+      robustNearBoundaryZ: safeRequestedTargetZ,
+      crowdedBoundaryZ: safeRequestedTargetZ,
+      currentScale: this.lookingGlassSourceDepthScale,
+      targetDiameter: this.frontSafetyProfile.targetDiameter ?? 3,
+    });
+    if (!rebase) return clamped;
+
+    this.lookingGlassSourceDepthScale = rebase.scale;
+    context.modelMatrix = scaleModelAboutSourceApex(
+      context.modelMatrix,
+      rebase.scaleFactor
+    );
+    this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
+    this.autoConvergencePausedUntilMs = 0;
+    this.autoConvergenceFastUntilMs = 0;
+    this.lastAutoConvergenceFrontBoundaryZ = null;
+    this.lastAutoConvergenceDepthTimestamp = -1;
+    this.lastLookingGlassSourceDepthRebaseTimestamp =
+      context.frame.timestampMs;
+    this.lastFrontSafetySampleMs = 0;
+    if (import.meta.env.DEV) {
+      console.debug('Looking Glass click source depth rebase', {
+        scale: rebase.scale,
+        foregroundLimited,
+        requestedTargetZ,
+      });
+    }
+
+    const configuredTargetZ = this.frontSafetyProfile.targetZ ?? 0;
+    return {
+      targetZ: configuredTargetZ,
+      limited: Math.abs(configuredTargetZ - requestedTargetZ) > 1e-6,
+      baselineLimited: false,
+      foregroundLimited,
+      sourceRebased: true,
+    };
+  }
+
+  setManualLookingGlassConvergenceTarget(
+    requestedTargetZ: number,
+    durationMs = LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS
+  ): LookingGlassConvergenceTargetClamp {
+    const clamped = this.getSafeLookingGlassConvergenceTarget(
+      requestedTargetZ
+    );
+    const duration = Number.isFinite(durationMs)
+      ? Math.max(durationMs, 0)
+      : LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS;
+    this.autoConvergencePausedUntilMs =
+      this.frontSafetyProfile.autoConvergence === true && duration > 0
+        ? performance.now() + duration
+        : 0;
+    this.autoConvergence.reset(clamped.targetZ);
+    this.lastFrontSafetySampleMs = 0;
+    this.autoConvergenceFastUntilMs = 0;
+    return clamped;
   }
 
   enableDepthMesh(): void {
     this.desiredMode = 'mesh';
+  }
+
+  pickLookingGlassFocus(
+    normalizedX: number,
+    normalizedY: number
+  ): LookingGlassDepthPick | null {
+    if (!this.latestLookingGlassPickContext) return null;
+    const start = performance.now();
+    const pick = pickLookingGlassDepthMesh({
+      ...this.latestLookingGlassPickContext,
+      normalizedX,
+      normalizedY,
+    });
+    perfStats.add('xr.pickFocus', performance.now() - start);
+    return pick;
   }
 
   async start(): Promise<void> {
@@ -232,6 +728,17 @@ export class RawXRTest {
     }
 
     this.xrFramingMode = null;
+    this.latestLookingGlassPickContext = null;
+    this.frontSafety.reset();
+    this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
+    this.autoConvergencePausedUntilMs = 0;
+    this.autoConvergenceFastUntilMs = 0;
+    this.lastAutoConvergenceFrontBoundaryZ = null;
+    this.lastAutoConvergenceDepthTimestamp = -1;
+    this.lookingGlassSourceDepthScale = 1;
+    this.lastLookingGlassSourceDepthRebaseTimestamp = -1;
+    this.lastFrontSafetySampleMs = 0;
+    this.lastFrontSafetyFrameMs = performance.now();
     this.sourceViewBaseOrientation.identity();
     this.orbitYaw = 0;
     this.orbitPitch = 0;
@@ -269,7 +776,12 @@ export class RawXRTest {
     }
 
     const baseLayer = new XRWebGLLayer(session, gl, { antialias: true, alpha: false });
-    session.updateRenderState({ baseLayer });
+    const depthNear = getXRSessionDepthNear(this.frontSafetyProfile);
+    session.updateRenderState(
+      depthNear === undefined
+        ? { baseLayer }
+        : { baseLayer, depthNear }
+    );
 
     // If the GL context is lost mid-session, end XR cleanly to avoid a stuck canvas.
     if (this.canvas) {
@@ -545,6 +1057,17 @@ export class RawXRTest {
     this.pendingSession = null;
     this.canvas = null;
     this.contextLostHandler = null;
+    this.latestLookingGlassPickContext = null;
+    this.frontSafety.reset();
+    this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
+    this.autoConvergencePausedUntilMs = 0;
+    this.autoConvergenceFastUntilMs = 0;
+    this.lastAutoConvergenceFrontBoundaryZ = null;
+    this.lastAutoConvergenceDepthTimestamp = -1;
+    this.lookingGlassSourceDepthScale = 1;
+    this.lastLookingGlassSourceDepthRebaseTimestamp = -1;
+    this.lastFrontSafetySampleMs = 0;
+    this.lastFrontSafetyFrameMs = 0;
 
     if (!hadResources) return;
     if (state) {
@@ -644,8 +1167,101 @@ export class RawXRTest {
         this.uploadVideoTexture(gl, s.mesh.videoTex, this.videoEl);
         this.lastUploadedVideoFrame = videoFrame;
       }
-      // model matrix is maintained in updateFromControllers (orbit/pan/zoom)
-      const model = this.meshModel.clone();
+      // model matrix is maintained in updateFromControllers (orbit/pan/zoom).
+      // Foreground safety adds only a rigid translation, preserving all
+      // reconstructed relative geometry.
+      const fixedSourceProjectionActive =
+        shouldUseLookingGlassFixedSourceProjection(
+          this.frontSafetyProfile,
+          controls
+        );
+      const configuredProjectionScale =
+        this.frontSafetyProfile.projectionScale ?? 1;
+      const sourceFitProjectionScale =
+        this.frontSafetyProfile.mode === 'looking-glass'
+          ? fixedSourceProjectionActive
+            ? configuredProjectionScale
+            : this.frontSafetyProfile.projectionZoom ?? 1
+          : 1;
+      const activeTargetDiameter =
+        this.frontSafetyProfile.mode === 'looking-glass'
+          ? (this.frontSafetyProfile.targetDiameter ?? 3) *
+            configuredProjectionScale /
+            sourceFitProjectionScale
+          : this.frontSafetyProfile.targetDiameter ?? 3;
+      const model = this.getFrontSafeModel(
+        this.meshModel,
+        depth,
+        effective,
+        controls.zMaxClip,
+        fixedSourceProjectionActive,
+        activeTargetDiameter
+      );
+      const projectionPanX =
+        this.frontSafetyProfile.mode === 'looking-glass'
+          ? this.frontSafetyProfile.projectionPanX ?? 0
+          : 0;
+      const projectionPanY =
+        this.frontSafetyProfile.mode === 'looking-glass'
+          ? this.frontSafetyProfile.projectionPanY ?? 0
+          : 0;
+      const centerView = pose.views[Math.floor(pose.views.length / 2)];
+      const centerViewMatrix = centerView
+        ? new THREE.Matrix4().fromArray(
+            centerView.transform.matrix as unknown as number[]
+          )
+        : null;
+      const useLookingGlassConvergence = fixedSourceProjectionActive;
+      const baselineCenterViewMatrix =
+        useLookingGlassConvergence && centerViewMatrix
+          ? centerViewMatrix.clone()
+          : null;
+      if (baselineCenterViewMatrix && pose.views.length > 1) {
+        const baselineCenter = new THREE.Vector3();
+        for (const view of pose.views) {
+          const matrix = view.transform.matrix;
+          baselineCenter.x += matrix[12];
+          baselineCenter.y += matrix[13];
+          baselineCenter.z += matrix[14];
+        }
+        baselineCenter.multiplyScalar(1 / pose.views.length);
+        baselineCenterViewMatrix.setPosition(baselineCenter);
+      }
+      const configuredTargetZ = this.frontSafetyProfile.targetZ ?? 0;
+      const effectiveTargetZ =
+        useLookingGlassConvergence
+          ? this.autoConvergence.value ?? configuredTargetZ
+          : configuredTargetZ;
+      const centerCameraZ = baselineCenterViewMatrix
+        ? new THREE.Vector3().setFromMatrixPosition(
+            baselineCenterViewMatrix
+          ).z
+        : 0;
+      const convergenceBaselineScale = baselineCenterViewMatrix
+        ? getLookingGlassConvergenceBaselineScale(
+            centerCameraZ,
+            configuredTargetZ,
+            effectiveTargetZ
+          )
+        : 1;
+      if (centerView) {
+        const centerProjection = scaleXRProjectionForSourceFit(
+          new THREE.Matrix4().fromArray(
+            centerView.projectionMatrix as unknown as number[]
+          ),
+          sourceFitProjectionScale,
+          projectionPanX,
+          projectionPanY
+        );
+        this.latestLookingGlassPickContext = {
+          cameraMatrixWorld: centerViewMatrix?.clone() ?? new THREE.Matrix4(),
+          projectionMatrix: centerProjection,
+          modelMatrix: model.clone(),
+          frame: depth,
+          controls: { ...controls },
+          calibration: this.calibration,
+        };
+      }
 
       for (const view of pose.views) {
         const viewport = s.baseLayer.getViewport(view);
@@ -657,9 +1273,26 @@ export class RawXRTest {
         gl.clearColor(0.05, 0.0, 0.0, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-        const viewMat = new THREE.Matrix4().fromArray(view.transform.matrix as unknown as number[]);
-        const camMat = viewMat.invert();
-        const proj = new THREE.Matrix4().fromArray(view.projectionMatrix as unknown as number[]);
+        const viewMat = new THREE.Matrix4().fromArray(
+          view.transform.matrix as unknown as number[]
+        );
+        const adjustedViewMat =
+          baselineCenterViewMatrix && convergenceBaselineScale !== 1
+          ? scaleXRViewBaseline(
+              viewMat,
+              baselineCenterViewMatrix,
+              convergenceBaselineScale
+            )
+          : viewMat;
+        const camMat = adjustedViewMat.invert();
+        const proj = scaleXRProjectionForSourceFit(
+          new THREE.Matrix4().fromArray(
+            view.projectionMatrix as unknown as number[]
+          ),
+          sourceFitProjectionScale,
+          projectionPanX,
+          projectionPanY
+        );
         const viewProj = new THREE.Matrix4().multiplyMatrices(proj, camMat);
 
         gl.useProgram(s.mesh.prog);
@@ -703,7 +1336,339 @@ export class RawXRTest {
       this.drawDebug(gl, s, pose);
     }
 
+    releaseXRPresentationState(gl);
     this.loop();
+  }
+
+  private getFrontSafeModel(
+    baseModel: THREE.Matrix4,
+    depth: DepthFrame,
+    effective: ReturnType<typeof getEffectiveGeometryControls>,
+    zMaxClip: number,
+    fixedSourceProjectionActive: boolean,
+    activeTargetDiameter: number
+  ): THREE.Matrix4 {
+    if (fixedSourceProjectionActive) {
+      const now = performance.now();
+      const deltaSeconds = this.lastFrontSafetyFrameMs > 0
+        ? (now - this.lastFrontSafetyFrameMs) / 1000
+        : 0;
+      this.lastFrontSafetyFrameMs = now;
+      const autoConvergenceEnabled =
+        this.frontSafetyProfile.mode === 'looking-glass' &&
+        this.frontSafetyProfile.autoConvergence === true;
+      const nearClipSafetyEnabled =
+        this.frontSafetyProfile.mode === 'looking-glass';
+      let sourceModel = scaleModelAboutSourceApex(
+        baseModel,
+        this.lookingGlassSourceDepthScale
+      );
+      let quantileDepths: number[] | null = null;
+      let sourceDepthRebased = false;
+
+      // Normal convergence remains rate-limited, but an entirely unreachable
+      // shot must recover on the first applied depth frame. q1 is a robust
+      // practical nearest point which ignores an isolated depth spike.
+      if (
+        nearClipSafetyEnabled &&
+        depth.timestampMs !==
+          this.lastLookingGlassSourceDepthRebaseTimestamp
+      ) {
+        quantileDepths = estimateRenderedDepthQuantiles(
+          depth,
+          effective,
+          zMaxClip,
+          [
+            LOOKING_GLASS_AUTO_REBASE_NEAR_QUANTILE,
+            LOOKING_GLASS_AUTO_CONVERGENCE_FRONT_QUANTILE,
+            LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE,
+          ]
+        );
+        this.lastLookingGlassSourceDepthRebaseTimestamp = depth.timestampMs;
+
+        if (quantileDepths) {
+          const [robustNearDepth, , crowdedBoundaryDepth] = quantileDepths;
+          const sourceOriginZ = new THREE.Vector3()
+            .setFromMatrixPosition(baseModel).z;
+          const robustNearBoundaryZ = new THREE.Vector3(
+            0,
+            0,
+            -robustNearDepth
+          ).applyMatrix4(sourceModel).z;
+          const crowdedBoundaryZ = new THREE.Vector3(
+            0,
+            0,
+            -crowdedBoundaryDepth
+          ).applyMatrix4(sourceModel).z;
+          const rebase = autoConvergenceEnabled
+            ? getLookingGlassSourceDepthScaleRebase({
+                sourceOriginZ,
+                // Fixed Source View anchors the source apex at the mean quilt
+                // camera. The central camera itself remains unchanged.
+                cameraCenterZ: sourceOriginZ,
+                configuredTargetZ: this.frontSafetyProfile.targetZ ?? 0,
+                robustNearBoundaryZ,
+                crowdedBoundaryZ,
+                currentScale: this.lookingGlassSourceDepthScale,
+                targetDiameter: activeTargetDiameter,
+              })
+            : null;
+
+          if (rebase) {
+            this.lookingGlassSourceDepthScale = rebase.scale;
+            sourceModel = scaleModelAboutSourceApex(
+              baseModel,
+              this.lookingGlassSourceDepthScale
+            );
+            sourceDepthRebased = true;
+            this.autoConvergence.reset(
+              this.frontSafetyProfile.targetZ
+            );
+            this.autoConvergencePausedUntilMs = 0;
+            this.autoConvergenceFastUntilMs =
+              now + LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS;
+            this.lastAutoConvergenceFrontBoundaryZ = null;
+            this.lastAutoConvergenceDepthTimestamp = -1;
+            this.lastFrontSafetySampleMs = 0;
+            if (import.meta.env.DEV) {
+              console.debug('Looking Glass source depth rebase', {
+                reason: rebase.reason,
+                scale: rebase.scale,
+                limited: rebase.limited,
+                timestampMs: depth.timestampMs,
+              });
+            }
+          }
+
+          // Lowering WebXR depthNear removes its fixed 0.1 m margin, but the
+          // vendor capture-volume bias can still place the actual near plane
+          // deep inside a close scene when entry happened on a distant shot.
+          // Reuse q1 to expand the complete reconstruction just enough that
+          // robust foreground remains renderable in every quilt view.
+          const captureTargetDiameter =
+            (this.frontSafetyProfile.targetDiameter ?? 3) *
+            (this.frontSafetyProfile.projectionScale ?? 1);
+          const nearClipRebase = getLookingGlassSourceNearClipRebase({
+            robustNearDepth,
+            currentScale: this.lookingGlassSourceDepthScale,
+            targetDiameter: captureTargetDiameter,
+            fovYRadians: DEFAULT_LOOKING_GLASS_FOV_Y,
+            depthNear: LOOKING_GLASS_XR_DEPTH_NEAR,
+          });
+          if (nearClipRebase) {
+            this.lookingGlassSourceDepthScale = nearClipRebase.scale;
+            sourceModel = scaleModelAboutSourceApex(
+              baseModel,
+              this.lookingGlassSourceDepthScale
+            );
+            sourceDepthRebased = true;
+            this.autoConvergence.reset(
+              this.frontSafetyProfile.targetZ
+            );
+            this.autoConvergencePausedUntilMs = 0;
+            this.autoConvergenceFastUntilMs =
+              now + LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS;
+            this.lastAutoConvergenceFrontBoundaryZ = null;
+            this.lastAutoConvergenceDepthTimestamp = -1;
+            this.lastFrontSafetySampleMs = 0;
+            if (import.meta.env.DEV) {
+              console.debug('Looking Glass near-plane source rebase', {
+                scale: nearClipRebase.scale,
+                currentNearDepth: nearClipRebase.currentNearDepth,
+                requiredNearDepth: nearClipRebase.requiredNearDepth,
+                limited: nearClipRebase.limited,
+                timestampMs: depth.timestampMs,
+              });
+            }
+          }
+        }
+      }
+
+      // q20 foreground overflow is spatially robust enough to be a safety
+      // signal. Evaluate it on every newly applied depth frame rather than
+      // waiting for the normal 250 ms convergence cadence. This removes the
+      // start-position/sample-phase window where a close cut can stay black.
+      if (
+        autoConvergenceEnabled &&
+        !sourceDepthRebased &&
+        quantileDepths &&
+        depth.timestampMs !== this.lastAutoConvergenceDepthTimestamp
+      ) {
+        const [, frontBoundaryDepth, crowdedBoundaryDepth] = quantileDepths;
+        const frontBoundaryZ = new THREE.Vector3(
+          0,
+          0,
+          -frontBoundaryDepth
+        ).applyMatrix4(sourceModel).z;
+        const crowdedBoundaryZ = new THREE.Vector3(
+          0,
+          0,
+          -crowdedBoundaryDepth
+        ).applyMatrix4(sourceModel).z;
+        const currentTargetZ =
+          this.autoConvergence.value ??
+          this.frontSafetyProfile.targetZ ??
+          0;
+        const urgency = classifyLookingGlassAutoConvergence({
+          frontBoundaryZ,
+          crowdedBoundaryZ,
+          currentTargetZ,
+          previousFrontBoundaryZ: this.lastAutoConvergenceFrontBoundaryZ,
+          targetDiameter: activeTargetDiameter,
+        });
+        if (urgency === 'crowded-front') {
+          const desiredTargetZ = getLookingGlassAutoConvergenceTarget(
+            frontBoundaryZ,
+            crowdedBoundaryZ
+          );
+          if (desiredTargetZ !== null) {
+            this.autoConvergencePausedUntilMs = 0;
+            this.autoConvergenceFastUntilMs = 0;
+            this.autoConvergence.snap(desiredTargetZ);
+            this.lastAutoConvergenceFrontBoundaryZ = frontBoundaryZ;
+            this.lastAutoConvergenceDepthTimestamp = depth.timestampMs;
+            this.lastFrontSafetySampleMs = now;
+            if (import.meta.env.DEV) {
+              console.debug('Looking Glass immediate foreground recovery', {
+                targetZ: desiredTargetZ,
+                timestampMs: depth.timestampMs,
+              });
+            }
+          }
+        }
+      }
+
+      if (
+        autoConvergenceEnabled &&
+        depth.timestampMs !== this.lastAutoConvergenceDepthTimestamp &&
+        (sourceDepthRebased ||
+          this.lastFrontSafetySampleMs === 0 ||
+          now - this.lastFrontSafetySampleMs >=
+            LOOKING_GLASS_AUTO_CONVERGENCE_SAMPLE_INTERVAL_MS)
+      ) {
+        quantileDepths ??= estimateRenderedDepthQuantiles(
+          depth,
+          effective,
+          zMaxClip,
+          [
+            LOOKING_GLASS_AUTO_REBASE_NEAR_QUANTILE,
+            LOOKING_GLASS_AUTO_CONVERGENCE_FRONT_QUANTILE,
+            LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE,
+          ]
+        );
+        if (quantileDepths) {
+          const [, frontBoundaryDepth, crowdedBoundaryDepth] = quantileDepths;
+          const frontBoundaryZ = new THREE.Vector3(
+            0,
+            0,
+            -frontBoundaryDepth
+          ).applyMatrix4(sourceModel).z;
+          const crowdedBoundaryZ = new THREE.Vector3(
+            0,
+            0,
+            -crowdedBoundaryDepth
+          ).applyMatrix4(sourceModel).z;
+          const desiredTargetZ = getLookingGlassAutoConvergenceTarget(
+            frontBoundaryZ,
+            crowdedBoundaryZ
+          );
+          const targetDiameter = activeTargetDiameter;
+          const currentTargetZ =
+            this.autoConvergence.value ??
+            this.frontSafetyProfile.targetZ ??
+            0;
+          const urgency = classifyLookingGlassAutoConvergence({
+            frontBoundaryZ,
+            crowdedBoundaryZ,
+            currentTargetZ,
+            previousFrontBoundaryZ:
+              this.lastAutoConvergenceFrontBoundaryZ,
+            targetDiameter,
+          });
+          this.lastAutoConvergenceFrontBoundaryZ = frontBoundaryZ;
+
+          if (
+            desiredTargetZ !== null &&
+            (sourceDepthRebased || urgency !== 'normal')
+          ) {
+            // Scene cuts and all-behind placement bypass both the four-second
+            // manual hold and three-observation confirmation, then ease over
+            // a short interval. Crowded foreground was already snapped above.
+            this.autoConvergencePausedUntilMs = 0;
+            this.autoConvergence.observeImmediate(desiredTargetZ);
+            this.autoConvergenceFastUntilMs =
+              now + LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS;
+          } else if (
+            desiredTargetZ !== null &&
+            now >= this.autoConvergencePausedUntilMs
+          ) {
+            // Keep the 20% boundary at zero parallax for a sharper, less
+            // distant scene while the 10% boundary still detects all-behind
+            // cuts. Normal motion needs three independent observations.
+            this.autoConvergence.observe(desiredTargetZ, targetDiameter);
+          }
+        }
+        this.lastAutoConvergenceDepthTimestamp = depth.timestampMs;
+        this.lastFrontSafetySampleMs = now;
+      }
+      this.autoConvergence.advance(
+        deltaSeconds,
+        now < this.autoConvergenceFastUntilMs
+          ? LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_RATE
+          : LOOKING_GLASS_AUTO_CONVERGENCE_NORMAL_RESPONSE_RATE
+      );
+      return sourceModel;
+    }
+    const now = performance.now();
+    if (
+      this.lastFrontSafetySampleMs === 0 ||
+      now - this.lastFrontSafetySampleMs >= FRONT_SAFETY_SAMPLE_INTERVAL_MS
+    ) {
+      const nearDepth = estimateRenderedNearDepth(
+        depth,
+        effective,
+        zMaxClip
+      );
+      if (nearDepth !== null) {
+        if (this.frontSafetyProfile.mode === 'looking-glass') {
+          const nearSurface = new THREE.Vector3(0, 0, -nearDepth)
+            .applyMatrix4(baseModel);
+          this.frontSafety.observe(
+            getLookingGlassRequiredPushback(
+              nearSurface.z,
+              this.frontSafetyProfile.targetZ ?? 0,
+              activeTargetDiameter
+            ),
+            LOOKING_GLASS_LATER_INCREASE_CONFIRMATION_SAMPLES
+          );
+        } else {
+          // Source View anchors the mesh origin at the initial viewer pose.
+          // Do not chase later head motion; that would make the world swim.
+          this.frontSafety.observe(getWebXRRequiredPushback(nearDepth));
+        }
+      }
+      this.lastFrontSafetySampleMs = now;
+    }
+
+    const deltaSeconds = this.lastFrontSafetyFrameMs > 0
+      ? (now - this.lastFrontSafetyFrameMs) / 1000
+      : 0;
+    this.lastFrontSafetyFrameMs = now;
+    const pushback = this.frontSafety.advance(deltaSeconds);
+    const model = baseModel.clone();
+    if (pushback <= 0) return model;
+
+    if (this.frontSafetyProfile.mode === 'looking-glass') {
+      // Looking Glass +z is toward the viewer. Move in global -z so the
+      // 20th-percentile image area remains inside its front depth budget.
+      model.premultiply(
+        new THREE.Matrix4().makeTranslation(0, 0, -pushback)
+      );
+    } else {
+      // Generic WebXR moves along the fixed source-camera forward axis.
+      model.multiply(new THREE.Matrix4().makeTranslation(0, 0, -pushback));
+    }
+    return model;
   }
 
   private makeProgram(gl: WebGL2RenderingContext, vs: string, fs: string): WebGLProgram {
@@ -831,7 +1796,10 @@ export class RawXRTest {
         void main(){\n
           // Keep video座標は左→右、上→下。サンプルは上下反転のみ。
           vUv = vec2(aUv.x, 1.0 - aUv.y);
-          float depth = texture(uDepthTex, vUv).r;\n
+          // HTML video is flipped during upload, while Float32Array depth rows
+          // retain their top-to-bottom order. RawXR grid y=0 is the top row, so
+          // depth samples aUv directly instead of reusing the video UV.
+          float depth = texture(uDepthTex, aUv).r;\n
           depth = pow(max(depth, 0.0), uZGamma);\n
           // Clip only the depth-derived component. Bias is a global offset and
           // should not be clamped, otherwise it saturates Z to a constant and
@@ -921,15 +1889,10 @@ export class RawXRTest {
   }
 
   private buildGrid(gl: WebGL2RenderingContext, aspect: number, targetTriangles: number): { vao: WebGLVertexArrayObject; indexCount: number; indexType: number } {
-    const epsilon = Math.max(targetTriangles, 10);
-    const nxFloat = Math.sqrt((epsilon * Math.max(aspect, 0.1)) / 2);
-    const nyFloat = Math.sqrt(epsilon / (2 * Math.max(aspect, 0.1)));
-    const segmentsX = Math.max(2, Math.round(nxFloat));
-    let segmentsY = Math.max(2, Math.round(nyFloat));
-    if (aspect < 1 && segmentsY > 1024) {
-      const stride = Math.ceil(segmentsY / 1024);
-      segmentsY = Math.max(2, Math.floor(segmentsY / stride));
-    }
+    const { segmentsX, segmentsY } = getGridSegments({
+      aspect,
+      targetTriangles,
+    });
 
     const verts: number[] = [];
     for (let y = 0; y <= segmentsY; y++) {
@@ -974,8 +1937,9 @@ export class RawXRTest {
   private uploadDepthTexture(gl: WebGL2RenderingContext, tex: WebGLTexture, frame: DepthFrame): void {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    // Ensure depth is flipped to match video (Video uses FLIP_Y=1)
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
+    // UNPACK_FLIP_Y_WEBGL does not transform ArrayBufferView uploads. Keep it
+    // disabled and sample this top-to-bottom typed data with aUv in the shader.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, frame.width, frame.height, 0, gl.RED, gl.FLOAT, frame.data);
   }
 
@@ -1015,6 +1979,12 @@ export class RawXRTest {
   ): void {
     if (this.xrFramingMode === framingMode) return;
     this.xrFramingMode = framingMode;
+    this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
+    this.autoConvergencePausedUntilMs = 0;
+    this.autoConvergenceFastUntilMs = 0;
+    this.lastAutoConvergenceFrontBoundaryZ = null;
+    this.lastAutoConvergenceDepthTimestamp = -1;
+    this.lastFrontSafetySampleMs = 0;
 
     if (framingMode !== 'source' || pose.views.length === 0) {
       this.sourceViewBaseOrientation.identity();

@@ -115,17 +115,23 @@ export function getOffAxisFrustum(
   near: number,
   far: number,
   eyeOffset: number,
-  convergenceDistance: number
+  convergenceDistance: number,
+  viewPanX = 0,
+  viewPanY = 0
 ): OffAxisFrustum {
   const safeConvergence = Math.max(convergenceDistance, near + Number.EPSILON);
   const top = near * Math.tan((fovYDegrees * Math.PI) / 360);
   const halfWidth = top * aspect;
-  const center = (-eyeOffset * near) / safeConvergence;
+  const safePanX = Number.isFinite(viewPanX) ? viewPanX : 0;
+  const safePanY = Number.isFinite(viewPanY) ? viewPanY : 0;
+  const centerX =
+    (-eyeOffset * near) / safeConvergence - safePanX * halfWidth;
+  const centerY = -safePanY * top;
   return {
-    left: -halfWidth + center,
-    right: halfWidth + center,
-    top,
-    bottom: -top,
+    left: -halfWidth + centerX,
+    right: halfWidth + centerX,
+    top: top + centerY,
+    bottom: -top + centerY,
     near,
     far,
   };

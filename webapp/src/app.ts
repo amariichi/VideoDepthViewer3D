@@ -1,18 +1,43 @@
 import { ControlPanel } from './ui/controls';
-import { uploadVideo, deleteSession } from './network/sessionApi';
+import {
+  VIDEO_TRANSFER_STATUS,
+  deleteSession,
+  describeVideoTransferError,
+  uploadVideo,
+} from './network/sessionApi';
 import { DepthClient } from './network/depthClient';
 import { RenderScene } from './render/scene';
 import { usePlayerStore } from './state/playerStore';
 import { RawXRTest } from './xrTest';
-import type { SessionInfo, DepthFrame } from './types';
+import type { SessionInfo, DepthFrame, ViewerControls } from './types';
 
 import { DepthBuffer } from './utils/depthBuffer';
 import { perfStats } from './utils/perfStats';
+import { apiUrl } from './utils/env';
 import { getModeTargetTriangles } from './performance/qualityPolicy';
+import { getProjectionCalibration } from './render/projection';
+import { LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS } from './render/frontSafety';
+import { estimateSourcePivotDepth } from './render/sourceView';
 import {
+  DEFAULT_LOOKING_GLASS_FOV_Y,
+  DEFAULT_LOOKING_GLASS_TARGET_DIAMETER,
   LookingGlassRuntime,
+  clampLookingGlassViewControls,
   describeLookingGlassFailure,
+  getLookingGlassFocusCompensation,
+  getLookingGlassEntryPivotEstimate,
+  getLookingGlassPresentationScale,
+  getLookingGlassSourceFit,
+  getLookingGlassTargetZ,
+  getLookingGlassTargetDiameterForPivot,
+  toLookingGlassViewConfig,
+  waitForLookingGlassBridge,
 } from './lookingGlass';
+import type {
+  LookingGlassSourceFit,
+  LookingGlassViewControls,
+} from './lookingGlass';
+import { getLookingGlassWheelZoom } from './lookingGlassInteraction';
 
 type XRDisplayMode = 'vr' | 'looking-glass';
 
@@ -30,6 +55,20 @@ export class VideoDepthApp {
   private latestDepthFrame: DepthFrame | null = null;
   private rawXR: RawXRTest | null = null;
   private readonly lookingGlassRuntime = new LookingGlassRuntime();
+  private lookingGlassViewControls: LookingGlassViewControls = {
+    zoom: 1,
+    autoConvergence: true,
+    panX: 0,
+    panY: 0,
+    focusBaseZ: 0,
+    focusTrimZ: 0,
+  };
+  private lookingGlassBaseTargetDiameter =
+    DEFAULT_LOOKING_GLASS_TARGET_DIAMETER;
+  private lookingGlassConfiguredTargetZ = 0;
+  private lookingGlassEntryPivotSampleCount = 0;
+  private lookingGlassSourceFit: LookingGlassSourceFit | null = null;
+  private lookingGlassPresentationCleanup: (() => void) | null = null;
   private suppressSeekRefresh = false;
   private lastAppliedDepthTimestamp = -1;
   private currentSyncDeltaMs = 0;
@@ -64,10 +103,46 @@ export class VideoDepthApp {
         onFileSelected: async (file) => this.handleFileSelected(file),
         getFrontendFps: () => this.getFrontendFps(),
         getSyncDeltaMs: () => this.currentSyncDeltaMs,
+        getFrontSafetyPushback: () =>
+          this.rawXR?.getFrontSafetyPushback() ?? 0,
+        getLookingGlassEffectiveTargetZ: () =>
+          this.rawXR?.getAutoConvergenceTargetZ() ??
+          getLookingGlassTargetZ(this.lookingGlassViewControls),
+        getLookingGlassSourceDepthScale: () =>
+          this.rawXR?.getLookingGlassSourceDepthScale() ?? 1,
         getViewDistance: () => this.renderScene.getViewDistance(),
         onViewDistanceChanged: (distance) => this.renderScene.setViewDistance(distance),
         getModelZOffset: () => this.renderScene.getModelZOffset(),
         onModelZOffsetChanged: (offset) => this.renderScene.setModelZOffset(offset),
+        onLookingGlassViewChanged: (controls) => {
+          this.setLookingGlassViewControls(controls, true);
+        },
+        onLookingGlassRefitForeground: () => {
+          if (this.lookingGlassSourceFit) {
+            this.controlPanel.updateStatus(
+              'Looking Glass Source View keeps mesh pushback disabled to preserve projection'
+            );
+            return;
+          }
+          this.rawXR?.refitFrontSafety();
+          this.controlPanel.updateStatus(
+            'Looking Glass foreground will re-fit on the next XR frame'
+          );
+        },
+        onLookingGlassResetView: () => {
+          this.setLookingGlassViewControls(
+            {
+              ...this.lookingGlassViewControls,
+              zoom: 1,
+              panX: 0,
+              panY: 0,
+            },
+            true
+          );
+          this.controlPanel.updateStatus(
+            'Looking Glass zoom and pan reset'
+          );
+        },
       }
     );
     this.renderScene.setViewDistanceChangeHandler((distance) => {
@@ -113,6 +188,395 @@ export class VideoDepthApp {
     });
 
     this.startRenderLoop();
+  }
+
+  private applyLookingGlassViewConfig(): void {
+    const config = {
+      ...toLookingGlassViewConfig(
+        this.lookingGlassViewControls,
+        this.lookingGlassBaseTargetDiameter
+      ),
+      fovy: DEFAULT_LOOKING_GLASS_FOV_Y,
+    };
+    this.lookingGlassConfiguredTargetZ = config.targetZ ?? 0;
+    this.lookingGlassRuntime.updateView(config);
+    this.applyLookingGlassRenderProfile(config);
+  }
+
+  private applyLookingGlassRenderProfile(
+    config?: ReturnType<typeof toLookingGlassViewConfig>
+  ): void {
+    const viewConfig = config ?? {
+      ...toLookingGlassViewConfig(
+        this.lookingGlassViewControls,
+        this.lookingGlassBaseTargetDiameter
+      ),
+      targetZ: this.lookingGlassConfiguredTargetZ,
+    };
+    const projectionScale = getLookingGlassPresentationScale(
+      this.lookingGlassSourceFit?.projectionScale ?? 1,
+      this.lookingGlassViewControls.zoom
+    );
+    this.rawXR?.setFrontSafetyProfile({
+      mode: 'looking-glass',
+      targetZ: viewConfig.targetZ ?? 0,
+      targetDiameter:
+        (viewConfig.targetDiam ?? DEFAULT_LOOKING_GLASS_TARGET_DIAMETER) /
+        projectionScale,
+      projectionScale,
+      projectionZoom: this.lookingGlassViewControls.zoom,
+      preserveSourceProjection: this.lookingGlassSourceFit !== null,
+      autoConvergence:
+        this.lookingGlassSourceFit !== null &&
+        this.lookingGlassViewControls.autoConvergence,
+      projectionPanX: this.lookingGlassViewControls.panX,
+      projectionPanY: this.lookingGlassViewControls.panY,
+    });
+  }
+
+  private setLookingGlassViewControls(
+    controls: LookingGlassViewControls,
+    applyToRuntime: boolean
+  ): {
+    focusCompensationLimited: boolean;
+    convergenceLimited: boolean;
+    foregroundLimited: boolean;
+    baselineLimited: boolean;
+    sourceRebased: boolean;
+    appliedTargetZ: number;
+  } {
+    let clamped = clampLookingGlassViewControls(controls);
+    const previousTargetZ = getLookingGlassTargetZ(
+      this.lookingGlassViewControls
+    );
+    const requestedTargetZ = getLookingGlassTargetZ(clamped);
+    const requestedFocusChanged =
+      Math.abs(requestedTargetZ - previousTargetZ) > 1e-6;
+    const autoChanged =
+      clamped.autoConvergence !==
+      this.lookingGlassViewControls.autoConvergence;
+    const viewerControls = this.getEffectiveViewerControls();
+    const sourceConvergenceActive =
+      this.lookingGlassSourceFit !== null &&
+      viewerControls.projectionMode === 'pinhole' &&
+      viewerControls.framingMode === 'source';
+    let convergenceLimited = false;
+    let foregroundLimited = false;
+    let baselineLimited = false;
+    let sourceRebased = false;
+
+    if (
+      applyToRuntime &&
+      sourceConvergenceActive &&
+      (requestedFocusChanged || autoChanged)
+    ) {
+      const safeTarget = this.rawXR?.prepareLookingGlassConvergenceTarget(
+        requestedTargetZ,
+        clamped.autoConvergence
+      );
+      if (safeTarget?.limited) {
+        convergenceLimited = true;
+        foregroundLimited = safeTarget.foregroundLimited;
+        baselineLimited = safeTarget.baselineLimited;
+        sourceRebased = safeTarget.sourceRebased === true;
+        const focusBaseChanged =
+          Math.abs(
+            clamped.focusBaseZ -
+            this.lookingGlassViewControls.focusBaseZ
+          ) > 1e-6;
+        clamped = clampLookingGlassViewControls(
+          focusBaseChanged
+            ? {
+                ...clamped,
+                focusBaseZ: safeTarget.targetZ - clamped.focusTrimZ,
+              }
+            : {
+                ...clamped,
+                focusTrimZ: safeTarget.targetZ - clamped.focusBaseZ,
+              }
+        );
+        if (
+          Math.abs(
+            getLookingGlassTargetZ(clamped) - safeTarget.targetZ
+          ) > 1e-6
+        ) {
+          clamped = clampLookingGlassViewControls({
+            ...clamped,
+            focusBaseZ: safeTarget.targetZ - clamped.focusTrimZ,
+          });
+        }
+      }
+    }
+
+    const nextTargetZ = getLookingGlassTargetZ(clamped);
+    const focusChanged = Math.abs(nextTargetZ - previousTargetZ) > 1e-6;
+    let focusCompensationLimited = false;
+
+    if (focusChanged && !sourceConvergenceActive) {
+      const diameterBeforeFocus = toLookingGlassViewConfig(
+        this.lookingGlassViewControls,
+        this.lookingGlassBaseTargetDiameter
+      ).targetDiam ?? DEFAULT_LOOKING_GLASS_TARGET_DIAMETER;
+      const compensation = getLookingGlassFocusCompensation(
+        previousTargetZ,
+        diameterBeforeFocus,
+        nextTargetZ,
+        DEFAULT_LOOKING_GLASS_FOV_Y
+      );
+      this.lookingGlassBaseTargetDiameter = compensation.targetDiameter;
+      focusCompensationLimited = compensation.limited;
+    }
+
+    this.lookingGlassViewControls = clamped;
+    this.controlPanel.setLookingGlassViewControls(clamped);
+    if (applyToRuntime) {
+      if (focusChanged && !sourceConvergenceActive) {
+        this.applyLookingGlassViewConfig();
+      } else {
+        this.applyLookingGlassRenderProfile();
+      }
+      if (
+        sourceConvergenceActive &&
+        (focusChanged || autoChanged || sourceRebased)
+      ) {
+        const applied = this.rawXR?.setManualLookingGlassConvergenceTarget(
+          nextTargetZ,
+          requestedFocusChanged && clamped.autoConvergence
+            ? LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS
+            : 0
+        );
+        if (applied?.limited) {
+          convergenceLimited = true;
+          foregroundLimited ||= applied.foregroundLimited;
+          baselineLimited ||= applied.baselineLimited;
+        }
+      }
+    }
+    return {
+      focusCompensationLimited,
+      convergenceLimited,
+      foregroundLimited,
+      baselineLimited,
+      sourceRebased,
+      appliedTargetZ: nextTargetZ,
+    };
+  }
+
+  private setLookingGlassAutoFitTargetDiameter(
+    neutralBaseTargetDiameter: number
+  ): boolean {
+    const controls = this.lookingGlassViewControls;
+    const targetZ = getLookingGlassTargetZ(controls);
+    const neutralTargetDiameter = toLookingGlassViewConfig(
+      { ...controls, focusBaseZ: 0, focusTrimZ: 0 },
+      neutralBaseTargetDiameter
+    ).targetDiam ?? DEFAULT_LOOKING_GLASS_TARGET_DIAMETER;
+    const compensation = getLookingGlassFocusCompensation(
+      0,
+      neutralTargetDiameter,
+      targetZ,
+      DEFAULT_LOOKING_GLASS_FOV_Y
+    );
+    this.lookingGlassBaseTargetDiameter = compensation.targetDiameter;
+    return compensation.limited;
+  }
+
+  private getLookingGlassEntryPivot(
+    controls: ViewerControls
+  ): ReturnType<typeof getLookingGlassEntryPivotEstimate> {
+    const fallbackPivot =
+      this.renderScene.getSourceViewDiagnostics().pivotDepth;
+    const currentTimeMs = this.videoEl.currentTime * 1000;
+    const nearbyFrames = this.depthBuffer.getFramesNear(
+      currentTimeMs,
+      1000,
+      7
+    );
+    const frames = nearbyFrames.length > 0
+      ? nearbyFrames
+      : this.latestDepthFrame
+        ? [this.latestDepthFrame]
+        : [];
+    const pivots = frames.map((frame) => {
+      const projection = getProjectionCalibration(
+        this.currentSession?.calibration ?? null,
+        controls,
+        frame.width / Math.max(frame.height, 1)
+      );
+      return estimateSourcePivotDepth(
+        frame.data,
+        frame.width,
+        frame.height,
+        projection.depthMetricScale,
+        controls.zMaxClip,
+        fallbackPivot
+      );
+    });
+    return getLookingGlassEntryPivotEstimate(pivots, fallbackPivot);
+  }
+
+  private async waitForLookingGlassEntryPivot(
+    controls: ViewerControls,
+    minimumSamples = 3,
+    timeoutMs = 1500
+  ): Promise<ReturnType<typeof getLookingGlassEntryPivotEstimate>> {
+    const deadline = performance.now() + timeoutMs;
+    let estimate = this.getLookingGlassEntryPivot(controls);
+    while (
+      estimate.sampleCount < minimumSamples &&
+      performance.now() < deadline
+    ) {
+      await new Promise<void>((resolve) => {
+        globalThis.setTimeout(resolve, 50);
+      });
+      estimate = this.getLookingGlassEntryPivot(controls);
+    }
+    return estimate;
+  }
+
+  private configureLookingGlassViewForEntry(
+    controls: ViewerControls,
+    displayAspect: number | null,
+    entryPivot?: ReturnType<typeof getLookingGlassEntryPivotEstimate>
+  ): LookingGlassSourceFit | null {
+    this.lookingGlassSourceFit = null;
+
+    const usesCalibratedSourceView =
+      controls.projectionMode === 'pinhole' &&
+      controls.framingMode === 'source';
+    const pivot = entryPivot ?? this.getLookingGlassEntryPivot(controls);
+    const pivotDepth = pivot.pivotDepth;
+    this.lookingGlassEntryPivotSampleCount = pivot.sampleCount;
+    const neutralBaseTargetDiameter = usesCalibratedSourceView
+      ? getLookingGlassTargetDiameterForPivot(
+          pivotDepth,
+          DEFAULT_LOOKING_GLASS_FOV_Y
+        )
+      : DEFAULT_LOOKING_GLASS_TARGET_DIAMETER;
+    this.setLookingGlassAutoFitTargetDiameter(neutralBaseTargetDiameter);
+
+    if (!usesCalibratedSourceView) return null;
+
+    const fallbackSourceAspect = this.currentSession
+      ? this.currentSession.displayWidth /
+        Math.max(this.currentSession.displayHeight, 1)
+      : this.videoEl.videoWidth /
+        Math.max(this.videoEl.videoHeight, 1);
+    const projection = getProjectionCalibration(
+      this.currentSession?.calibration ?? null,
+      controls,
+      fallbackSourceAspect || 16 / 9
+    );
+    const fit = getLookingGlassSourceFit(
+      projection,
+      displayAspect ?? 16 / 9
+    );
+    this.lookingGlassSourceFit = fit;
+    return this.lookingGlassSourceFit;
+  }
+
+  private handleLookingGlassWheel(input: {
+    deltaY: number;
+    deltaMode: number;
+    pageHeightPx: number;
+  }): void {
+    const zoom = getLookingGlassWheelZoom(
+      this.lookingGlassViewControls.zoom,
+      input.deltaY,
+      input.deltaMode,
+      input.pageHeightPx
+    );
+    if (zoom === this.lookingGlassViewControls.zoom) return;
+
+    this.setLookingGlassViewControls(
+      { ...this.lookingGlassViewControls, zoom },
+      true
+    );
+    this.controlPanel.updateStatus(
+      `Looking Glass zoom ${zoom.toFixed(2)}×`
+    );
+  }
+
+  private handleLookingGlassPan(input: {
+    deltaX: number;
+    deltaY: number;
+  }): void {
+    const controls = clampLookingGlassViewControls({
+      ...this.lookingGlassViewControls,
+      panX: this.lookingGlassViewControls.panX + input.deltaX,
+      panY: this.lookingGlassViewControls.panY + input.deltaY,
+    });
+    if (
+      controls.panX === this.lookingGlassViewControls.panX &&
+      controls.panY === this.lookingGlassViewControls.panY
+    ) {
+      return;
+    }
+    this.setLookingGlassViewControls(controls, true);
+  }
+
+  private handleLookingGlassFocusRequest(input: {
+    normalizedX: number;
+    normalizedY: number;
+  }): void {
+    const pick = this.rawXR?.pickLookingGlassFocus(
+      input.normalizedX,
+      input.normalizedY
+    );
+    if (!pick) {
+      this.controlPanel.updateStatus(
+        'Looking Glass focus: no stable depth at cursor'
+      );
+      return;
+    }
+
+    const requestedFocusBaseZ = pick.point.z;
+    const controls = clampLookingGlassViewControls({
+      ...this.lookingGlassViewControls,
+      focusBaseZ: requestedFocusBaseZ,
+      focusTrimZ: 0,
+    });
+    const {
+      focusCompensationLimited,
+      foregroundLimited,
+      baselineLimited,
+      sourceRebased,
+      appliedTargetZ,
+    } =
+      this.setLookingGlassViewControls(controls, true);
+    const focusRangeLimited =
+      !sourceRebased &&
+      Math.abs(controls.focusBaseZ - requestedFocusBaseZ) > 1e-3;
+    const limitations = [
+      sourceRebased ? 'scene depth rebased' : null,
+      focusRangeLimited ? 'focus range' : null,
+      foregroundLimited ? 'foreground safety' : null,
+      baselineLimited ? 'convergence range' : null,
+      focusCompensationLimited ? 'framing compensation' : null,
+    ].filter((value): value is string => value !== null);
+    this.controlPanel.updateStatus(
+      limitations.length > 0
+        ? `Looking Glass target Z ${appliedTargetZ.toFixed(2)} (${limitations.join(' and ')} limited)`
+        : controls.autoConvergence
+          ? `Looking Glass target Z ${appliedTargetZ.toFixed(2)}; auto placement held up to 4 s`
+          : `Looking Glass target Z ${appliedTargetZ.toFixed(2)}; manual placement held`
+    );
+  }
+
+  private attachLookingGlassPresentationInput(): void {
+    this.detachLookingGlassPresentationInput();
+    this.lookingGlassPresentationCleanup =
+      this.lookingGlassRuntime.bindPresentationInput({
+        onWheel: (input) => this.handleLookingGlassWheel(input),
+        onFocusRequest: (input) =>
+          this.handleLookingGlassFocusRequest(input),
+        onPan: (input) => this.handleLookingGlassPan(input),
+      });
+  }
+
+  private detachLookingGlassPresentationInput(): void {
+    this.lookingGlassPresentationCleanup?.();
+    this.lookingGlassPresentationCleanup = null;
   }
 
   private mountXRButtons(): void {
@@ -181,6 +645,7 @@ export class VideoDepthApp {
       transitioning = false;
       this.resumeRenderLoop();
       if (endedMode === 'looking-glass') {
+        this.detachLookingGlassPresentationInput();
         setLookingGlassStatus(
           'Monitor',
           'Looking Glass ended; monitor rendering is active.'
@@ -200,6 +665,33 @@ export class VideoDepthApp {
       this.rawXR.setControlsGetter(() => this.getEffectiveViewerControls());
       this.rawXR.setCalibration(this.currentSession?.calibration ?? null);
       this.rawXR.setDepthBuffer(this.depthBuffer);
+      if (mode === 'looking-glass') {
+        const config = toLookingGlassViewConfig(
+          this.lookingGlassViewControls,
+          this.lookingGlassBaseTargetDiameter
+        );
+        const projectionScale = getLookingGlassPresentationScale(
+          this.lookingGlassSourceFit?.projectionScale ?? 1,
+          this.lookingGlassViewControls.zoom
+        );
+        this.rawXR.setFrontSafetyProfile({
+          mode: 'looking-glass',
+          targetZ: this.lookingGlassConfiguredTargetZ,
+          targetDiameter:
+            (config.targetDiam ?? DEFAULT_LOOKING_GLASS_TARGET_DIAMETER) /
+            projectionScale,
+          projectionScale,
+          projectionZoom: this.lookingGlassViewControls.zoom,
+          preserveSourceProjection: this.lookingGlassSourceFit !== null,
+          autoConvergence:
+            this.lookingGlassSourceFit !== null &&
+            this.lookingGlassViewControls.autoConvergence,
+          projectionPanX: this.lookingGlassViewControls.panX,
+          projectionPanY: this.lookingGlassViewControls.panY,
+        });
+      } else {
+        this.rawXR.setFrontSafetyProfile({ mode: 'webxr' });
+      }
       this.rawXR.setSessionEndedCallback(handleXRSessionEnded);
       this.rawXR.enableDepthMesh();
       this.rawXR.setHintsEnabled(mode === 'vr' && helpCheckbox.checked);
@@ -211,6 +703,9 @@ export class VideoDepthApp {
       if (activeMode === mode) {
         transitioning = true;
         refreshXRButtons();
+        if (mode === 'looking-glass') {
+          this.detachLookingGlassPresentationInput();
+        }
         await this.rawXR?.stop();
         return;
       }
@@ -224,9 +719,35 @@ export class VideoDepthApp {
         if (mode === 'looking-glass') {
           setLookingGlassStatus(
             'Starting…',
-            'Loading the Looking Glass WebXR runtime.'
+            'Checking Bridge before loading the Looking Glass WebXR runtime.'
           );
+          // @lookingglass/webxr 0.6.0 performs a one-shot calibration request
+          // when its module is evaluated and does not reconnect after failure.
+          // Do not import/install it until the local Bridge socket is ready.
+          await waitForLookingGlassBridge();
           await this.lookingGlassRuntime.activate();
+          const displayAspect =
+            await this.lookingGlassRuntime.waitForDisplayCalibration();
+          const controls = this.getEffectiveViewerControls();
+          const usesCalibratedSourceView =
+            controls.projectionMode === 'pinhole' &&
+            controls.framingMode === 'source';
+          let entryPivot:
+            | ReturnType<typeof getLookingGlassEntryPivotEstimate>
+            | undefined;
+          if (usesCalibratedSourceView) {
+            setLookingGlassStatus(
+              'Starting…',
+              'Stabilizing current depth before fixing the display camera.'
+            );
+            entryPivot = await this.waitForLookingGlassEntryPivot(controls);
+          }
+          this.configureLookingGlassViewForEntry(
+            controls,
+            displayAspect,
+            entryPivot
+          );
+          this.applyLookingGlassViewConfig();
           // The official polyfill overrides navigator.xr for the lifetime of
           // this page. Keep generic VR disabled after this point.
           lookingGlassRuntimeSelected = true;
@@ -235,6 +756,13 @@ export class VideoDepthApp {
         const rawXR = prepareRawXR(mode);
         this.pauseRenderLoop();
         await rawXR.start();
+        if (mode === 'looking-glass') {
+          // The 0.6.0 polyfill installs its final presentation-shader listener
+          // while XRWebGLLayer is constructed. Re-emit configuration now so a
+          // calibration received before entry cannot leave that shader unlinked.
+          this.lookingGlassRuntime.refreshAfterLayerCreation();
+          this.attachLookingGlassPresentationInput();
+        }
         if (activeMode !== mode) return;
 
         let lookingGlassPresentation = {
@@ -256,11 +784,19 @@ export class VideoDepthApp {
             );
             this.controlPanel.updateStatus('Looking Glass window blocked');
           } else if (lookingGlassPresentation.displayDetected) {
+            const fit = this.lookingGlassSourceFit;
+            const fitSummary = fit
+              ? ` Full-source projection: ${fit.verticalFovDegrees.toFixed(0)}°V × ${fit.horizontalFovDegrees.toFixed(0)}°H effective${fit.limited ? ' (limited)' : ''}; Bridge camera stays 40°V; entry pivot used ${this.lookingGlassEntryPivotSampleCount} depth sample${this.lookingGlassEntryPivotSampleCount === 1 ? '' : 's'}.`
+              : '';
             setLookingGlassStatus(
               'Active',
-              'Bridge calibration is active on the RawXR depth-mesh path.'
+              `Bridge calibration is active.${fitSummary} Wheel to zoom; click stable depth to focus.`
             );
-            this.controlPanel.updateStatus('Looking Glass active');
+            this.controlPanel.updateStatus(
+              fit
+                ? `Looking Glass active; full-source fit ${(fit.projectionScale * 100).toFixed(0)}%`
+                : 'Looking Glass active'
+            );
           } else {
             setLookingGlassStatus(
               'Unverified',
@@ -283,6 +819,7 @@ export class VideoDepthApp {
         this.resumeRenderLoop();
         transitioning = false;
         if (mode === 'looking-glass') {
+          this.detachLookingGlassPresentationInput();
           const failure = describeLookingGlassFailure(err);
           setLookingGlassStatus(failure.label, failure.detail, true);
           this.controlPanel.updateStatus(`Looking Glass ${failure.label.toLowerCase()}`);
@@ -292,18 +829,6 @@ export class VideoDepthApp {
         refreshXRButtons();
       }
     };
-
-    // Preload the code chunk on intent, but do not install the page-wide WebXR
-    // override until the explicit Looking Glass activation click.
-    const preloadLookingGlass = (): void => {
-      this.lookingGlassRuntime.preload().catch((err: unknown) => {
-        console.debug('Looking Glass preload failed', err);
-      });
-    };
-    lookingGlassBtn.addEventListener('pointerenter', preloadLookingGlass, {
-      once: true,
-    });
-    lookingGlassBtn.addEventListener('focus', preloadLookingGlass, { once: true });
 
     rawVrBtn.addEventListener('click', () => {
       void startXR('vr');
@@ -377,20 +902,29 @@ export class VideoDepthApp {
   }
 
   private async handleFileSelected(file: File): Promise<void> {
-    await this.cleanupSession();
-    this.controlPanel.updateStatus('バックエンド処理用に動画を転送中...');
-    const session = await uploadVideo(file);
-    this.currentSession = session;
-    usePlayerStore.getState().setSession(session);
-    usePlayerStore.getState().updateControls({ framingMode: 'source' });
-    this.controlPanel.setFramingMode('source');
-    this.renderScene.setCalibration(session.calibration);
-    this.rawXR?.setCalibration(session.calibration);
-    this.controlPanel.updateStatus(
-      `Session ${session.sessionId} (${session.displayWidth}x${session.displayHeight})`
-    );
-    this.openVideo(file);
-    this.openDepthStream(session);
+    try {
+      await this.cleanupSession();
+      this.controlPanel.updateStatus(VIDEO_TRANSFER_STATUS);
+      const session = await uploadVideo(file);
+      this.currentSession = session;
+      usePlayerStore.getState().setSession(session);
+      usePlayerStore.getState().updateControls({ framingMode: 'source' });
+      this.controlPanel.setFramingMode('source');
+      this.renderScene.setCalibration(session.calibration);
+      this.rawXR?.setCalibration(session.calibration);
+      this.controlPanel.updateStatus(
+        `Session ${session.sessionId} (${session.displayWidth}x${session.displayHeight})`
+      );
+      this.openVideo(file);
+      this.openDepthStream(session);
+    } catch (error) {
+      console.error('Failed to create video session', error);
+      this.currentSession = null;
+      usePlayerStore.getState().setSession(null);
+      usePlayerStore.getState().setDepthConnected(false);
+      this.controlPanel.updateStatus(describeVideoTransferError(error));
+      this.resumeRenderLoop();
+    }
   }
 
   private openVideo(file: File): void {
@@ -621,11 +1155,16 @@ export class VideoDepthApp {
 
     // XR owns its own canvas and reads the current session/depth buffer.
     // End it before replacing or deleting those resources.
+    this.detachLookingGlassPresentationInput();
     await this.rawXR?.stop();
 
-    if (this.currentSession) {
+    const currentSession = this.currentSession;
+    this.currentSession = null;
+    usePlayerStore.getState().setSession(null);
+    usePlayerStore.getState().setDepthConnected(false);
+    if (currentSession) {
       try {
-        await deleteSession(this.currentSession.sessionId);
+        await deleteSession(currentSession.sessionId);
       } catch (e) {
         console.warn('Failed to delete session', e);
       }
@@ -703,7 +1242,7 @@ export class VideoDepthApp {
       }
 
       // Send to backend for centralized logging
-      fetch('/api/log', {
+      fetch(apiUrl('/api/log'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: msg }),

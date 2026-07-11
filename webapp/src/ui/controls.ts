@@ -1,15 +1,26 @@
 import GUI from 'lil-gui';
 import { usePlayerStore } from '../state/playerStore';
 import type { ViewFramingMode } from '../types';
+import {
+  LOOKING_GLASS_VIEW_RANGES,
+  getLookingGlassTargetZ,
+  type LookingGlassViewControls,
+} from '../lookingGlass';
 
 interface ControlCallbacks {
   onFileSelected: (file: File) => Promise<void>;
   getFrontendFps: () => number;
   getSyncDeltaMs: () => number;
+  getFrontSafetyPushback: () => number;
+  getLookingGlassEffectiveTargetZ: () => number;
+  getLookingGlassSourceDepthScale: () => number;
   getViewDistance: () => number;
   onViewDistanceChanged: (distance: number) => void;
   getModelZOffset: () => number;
   onModelZOffsetChanged: (offset: number) => void;
+  onLookingGlassViewChanged: (controls: LookingGlassViewControls) => void;
+  onLookingGlassRefitForeground: () => void;
+  onLookingGlassResetView: () => void;
 }
 
 interface ControlElements {
@@ -27,9 +38,28 @@ export class ControlPanel {
   private framingState: { framingMode: ViewFramingMode } = { framingMode: 'source' };
   private viewDistanceState = { cameraDistance: 3.5 };
   private modelZState = { modelZOffset: 0 };
+  private lookingGlassViewState: LookingGlassViewControls & {
+    targetZ: number;
+    refitForeground: () => void;
+    resetView: () => void;
+  } = {
+    zoom: 1,
+    autoConvergence: true,
+    panX: 0,
+    panY: 0,
+    focusBaseZ: 0,
+    focusTrimZ: 0,
+    targetZ: 0,
+    refitForeground: () => this.callbacks.onLookingGlassRefitForeground(),
+    resetView: () => this.callbacks.onLookingGlassResetView(),
+  };
   private framingModeController: ReturnType<GUI['add']> | null = null;
   private cameraDistanceController: ReturnType<GUI['add']> | null = null;
   private modelZController: ReturnType<GUI['add']> | null = null;
+  private lookingGlassZoomController: ReturnType<GUI['add']> | null = null;
+  private lookingGlassAutoConvergenceController: ReturnType<GUI['add']> | null = null;
+  private lookingGlassFocusTrimController: ReturnType<GUI['add']> | null = null;
+  private lookingGlassTargetController: ReturnType<GUI['add']> | null = null;
 
   constructor(elements: ControlElements, callbacks: ControlCallbacks) {
     this.elements = elements;
@@ -48,8 +78,12 @@ export class ControlPanel {
       const input = event.target as HTMLInputElement;
       const file = input.files?.[0];
       if (!file) return;
-      await this.callbacks.onFileSelected(file);
-      input.value = '';
+      try {
+        await this.callbacks.onFileSelected(file);
+      } finally {
+        // Allow retrying the same file after a backend or validation failure.
+        input.value = '';
+      }
     });
   }
 
@@ -83,6 +117,8 @@ export class ControlPanel {
         this.setFramingMode(value);
         usePlayerStore.getState().updateControls({ framingMode: value });
       });
+    this.framingModeController.domElement.title =
+      'Auto Source View: wheel zooms around the cursor and dragging pans without leaving Source View. Double-click resets.';
     const meshFolder = folder.addFolder('Advanced / Mesh');
     meshFolder.add(store.viewerControls, 'targetTriangles', 50_000, 300_000, 10_000).name('Manual target tris').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ targetTriangles: value });
@@ -117,6 +153,64 @@ export class ControlPanel {
     creativeFolder.add(store.viewerControls, 'planeScale', 0.5, 3.5, 0.1).name('Plane Scale').onChange((value: number) => {
       usePlayerStore.getState().updateControls({ planeScale: value });
     });
+    const lookingGlassFolder = folder.addFolder('Looking Glass');
+    const applyLookingGlassView = (): void => {
+      this.callbacks.onLookingGlassViewChanged({
+        zoom: this.lookingGlassViewState.zoom,
+        autoConvergence: this.lookingGlassViewState.autoConvergence,
+        panX: this.lookingGlassViewState.panX,
+        panY: this.lookingGlassViewState.panY,
+        focusBaseZ: this.lookingGlassViewState.focusBaseZ,
+        focusTrimZ: this.lookingGlassViewState.focusTrimZ,
+      });
+    };
+    this.lookingGlassZoomController = lookingGlassFolder
+      .add(
+        this.lookingGlassViewState,
+        'zoom',
+        LOOKING_GLASS_VIEW_RANGES.zoom.min,
+        LOOKING_GLASS_VIEW_RANGES.zoom.max,
+        LOOKING_GLASS_VIEW_RANGES.zoom.step
+      )
+      .name('Hologram Zoom')
+      .onFinishChange(applyLookingGlassView);
+    this.lookingGlassZoomController.domElement.title =
+      'Pure projection zoom (0.25–4): enlarges/crops without moving the Looking Glass camera or metric mesh. Wheel input snaps at 1×.';
+    this.lookingGlassAutoConvergenceController = lookingGlassFolder
+      .add(this.lookingGlassViewState, 'autoConvergence')
+      .name('Auto Depth Placement')
+      .onChange(applyLookingGlassView);
+    this.lookingGlassAutoConvergenceController.domElement.title =
+      'Looking Glass Source View only: keeps the front 20% depth boundary near zero parallax. Crowded foreground snaps on the next depth frame. Disable for indefinite manual focus; hard q1 near-plane clipping protection remains active.';
+    this.lookingGlassFocusTrimController = lookingGlassFolder
+      .add(
+        this.lookingGlassViewState,
+        'focusTrimZ',
+        LOOKING_GLASS_VIEW_RANGES.focusTrimZ.min,
+        LOOKING_GLASS_VIEW_RANGES.focusTrimZ.max,
+        LOOKING_GLASS_VIEW_RANGES.focusTrimZ.step
+      )
+      .name('Focus Trim')
+      .onFinishChange(applyLookingGlassView);
+    this.lookingGlassFocusTrimController.domElement.title =
+      'Fixed -2 to 2 adjustment relative to the depth selected by clicking the Looking Glass display. A click resets this trim to zero.';
+    this.lookingGlassTargetController = lookingGlassFolder
+      .add(this.lookingGlassViewState, 'targetZ')
+      .name('Effective Target Z')
+      .listen()
+      .disable();
+    this.lookingGlassTargetController.domElement.title =
+      'The active zero-parallax world Z. With Auto Depth Placement enabled this follows the stabilized depth distribution; negative values are valid.';
+    const resetLookingGlassViewController = lookingGlassFolder
+      .add(this.lookingGlassViewState, 'resetView')
+      .name('Reset Zoom / Pan');
+    resetLookingGlassViewController.domElement.title =
+      'Restore the fitted 1× projection and centered pan without changing depth focus.';
+    const refitForegroundController = lookingGlassFolder
+      .add(this.lookingGlassViewState, 'refitForeground')
+      .name('Re-fit Foreground');
+    refitForegroundController.domElement.title =
+      'Discard accumulated automatic pushback in Free Orbit or Creative Relief. Auto Source View keeps mesh pushback disabled to preserve straight borders.';
     placementFolder.add(store.viewerControls, 'yOffset', 0.0, 2.0, 0.05).name('Y Offset').onChange((value: number) => {
       this.setFramingMode('orbit');
       usePlayerStore.getState().updateControls({ framingMode: 'orbit', yOffset: value });
@@ -124,6 +218,7 @@ export class ControlPanel {
     meshFolder.close();
     placementFolder.close();
     creativeFolder.close();
+    lookingGlassFolder.close();
 
     const perfFolder = this.perfGui; // no extra nesting
     perfFolder
@@ -163,6 +258,8 @@ export class ControlPanel {
     const stats = {
       queue: 0,
       infer: 0,
+      inferWait: 0,
+      normalize: 0,
       pack: 0,
       send: 0,
       decode: 0,
@@ -176,10 +273,14 @@ export class ControlPanel {
       calibration: '-',
       fps: 0,
       syncMs: 0,
+      frontPushback: 0,
+      lgDepthScale: 1,
     };
     const monitorFolder = perfFolder.addFolder('Live Telemetry');
     monitorFolder.add(stats, 'queue').name('Queue (s)').listen().disable();
     monitorFolder.add(stats, 'decode').name('Decode (s)').listen().disable();
+    monitorFolder.add(stats, 'normalize').name('Normalize (s)').listen().disable();
+    monitorFolder.add(stats, 'inferWait').name('Infer wait (s)').listen().disable();
     monitorFolder.add(stats, 'infer').name('Infer (s)').listen().disable();
     monitorFolder.add(stats, 'pack').name('Pack (s)').listen().disable();
     monitorFolder.add(stats, 'send').name('Send (s)').listen().disable();
@@ -193,6 +294,16 @@ export class ControlPanel {
     monitorFolder.add(stats, 'calibration').name('Calibration').listen().disable();
     monitorFolder.add(stats, 'fps').name('Depth FPS').listen().disable();
     monitorFolder.add(stats, 'syncMs').name('Sync delta (ms)').listen().disable();
+    monitorFolder
+      .add(stats, 'frontPushback')
+      .name('XR auto pushback')
+      .listen()
+      .disable();
+    monitorFolder
+      .add(stats, 'lgDepthScale')
+      .name('LG source depth scale')
+      .listen()
+      .disable();
 
     setInterval(async () => {
       const client = usePlayerStore.getState().depthClient;
@@ -202,6 +313,12 @@ export class ControlPanel {
           // console.debug('Telemetry update', data.telemetry);
           stats.queue = parseFloat(data.telemetry.queue_wait_s?.toFixed(3) ?? '0');
           stats.decode = parseFloat(data.telemetry.decode_s?.toFixed(3) ?? '0');
+          stats.normalize = parseFloat(
+            data.telemetry.normalize_s?.toFixed(3) ?? '0'
+          );
+          stats.inferWait = parseFloat(
+            data.telemetry.infer_wait_s?.toFixed(3) ?? '0'
+          );
           stats.infer = parseFloat(data.telemetry.infer_s?.toFixed(3) ?? '0');
           stats.pack = parseFloat(data.telemetry.pack_s?.toFixed(3) ?? '0');
           stats.send = parseFloat(data.telemetry.ws_send_s?.toFixed(3) ?? '0');
@@ -227,6 +344,19 @@ export class ControlPanel {
       }
       stats.fps = this.callbacks.getFrontendFps();
       stats.syncMs = parseFloat(this.callbacks.getSyncDeltaMs().toFixed(1));
+      stats.frontPushback = parseFloat(
+        this.callbacks.getFrontSafetyPushback().toFixed(2)
+      );
+      stats.lgDepthScale = parseFloat(
+        this.callbacks.getLookingGlassSourceDepthScale().toFixed(3)
+      );
+      if (this.lookingGlassViewState.autoConvergence) {
+        const targetZ = this.callbacks.getLookingGlassEffectiveTargetZ();
+        if (Number.isFinite(targetZ)) {
+          this.lookingGlassViewState.targetZ = targetZ;
+          this.lookingGlassTargetController?.updateDisplay();
+        }
+      }
     }, 500);
 
     perfFolder.close();
@@ -244,6 +374,20 @@ export class ControlPanel {
   setModelZOffset(offset: number): void {
     this.modelZState.modelZOffset = offset;
     this.modelZController?.updateDisplay();
+  }
+
+  setLookingGlassViewControls(controls: LookingGlassViewControls): void {
+    this.lookingGlassViewState.zoom = controls.zoom;
+    this.lookingGlassViewState.autoConvergence = controls.autoConvergence;
+    this.lookingGlassViewState.panX = controls.panX;
+    this.lookingGlassViewState.panY = controls.panY;
+    this.lookingGlassViewState.focusBaseZ = controls.focusBaseZ;
+    this.lookingGlassViewState.focusTrimZ = controls.focusTrimZ;
+    this.lookingGlassViewState.targetZ = getLookingGlassTargetZ(controls);
+    this.lookingGlassZoomController?.updateDisplay();
+    this.lookingGlassAutoConvergenceController?.updateDisplay();
+    this.lookingGlassFocusTrimController?.updateDisplay();
+    this.lookingGlassTargetController?.updateDisplay();
   }
 
   setFramingMode(mode: ViewFramingMode): void {

@@ -44,6 +44,8 @@ class QualityMetrics:
     infer_s: float = 0.0
     infer_wait_s: float = 0.0
     decode_s: float = 0.0
+    normalize_s: float = 0.0
+    pack_s: float = 0.0
     queue_s: float = 0.0
     send_s: float = 0.0
     latency_ms: float = 0.0
@@ -123,6 +125,8 @@ class AdaptiveQualityController:
             metrics.infer_s
             + metrics.infer_wait_s
             + metrics.decode_s
+            + metrics.normalize_s
+            + metrics.pack_s
             + metrics.queue_s
             + metrics.send_s
         )

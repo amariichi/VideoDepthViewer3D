@@ -2,10 +2,17 @@ import { describe, expect, it } from 'vitest';
 import type { ProjectionCalibration } from './projection';
 import { unprojectTextureUv } from './projection';
 import {
+  SOURCE_VIEW_MAX_PAN,
+  SOURCE_VIEW_ZOOM_RANGE,
+  clampSourceViewNavigation,
   estimateSourcePivotDepth,
+  getDefaultSourceViewNavigation,
   getSourceViewFitFovY,
   getSourceViewFovY,
   getSourceViewLayout,
+  getSourceViewZoomFovY,
+  panSourceViewBy,
+  zoomSourceViewAt,
 } from './sourceView';
 
 const centeredProjection: ProjectionCalibration = {
@@ -111,5 +118,48 @@ describe('Source View framing', () => {
     const depth = new Float32Array(16);
 
     expect(estimateSourcePivotDepth(depth, 4, 4, 1, 50, 2.75)).toBe(2.75);
+  });
+
+  it('zooms the fitted view without changing source-camera calibration', () => {
+    const baseFov = getSourceViewFitFovY(centeredProjection, 8 / 9, 0);
+
+    expect(getSourceViewZoomFovY(baseFov, 2)).toBeLessThan(baseFov);
+    expect(getSourceViewZoomFovY(baseFov, 0.5)).toBeGreaterThan(baseFov);
+    expect(getSourceViewZoomFovY(baseFov, 1)).toBeCloseTo(baseFov, 12);
+  });
+
+  it('keeps the source point under the cursor anchored while zooming', () => {
+    const cursor = { x: 0.6, y: -0.4 };
+    const before = getDefaultSourceViewNavigation();
+    const sourceX = (cursor.x - before.panX) / before.zoom;
+    const sourceY = (cursor.y - before.panY) / before.zoom;
+    const after = zoomSourceViewAt(before, -200, cursor.x, cursor.y);
+
+    expect(after.zoom).toBeGreaterThan(before.zoom);
+    expect(after.zoom * sourceX + after.panX).toBeCloseTo(cursor.x, 12);
+    expect(after.zoom * sourceY + after.panY).toBeCloseTo(cursor.y, 12);
+  });
+
+  it('bounds source-view wheel zoom and drag pan', () => {
+    let navigation = getDefaultSourceViewNavigation();
+    for (let i = 0; i < 10; i += 1) {
+      navigation = zoomSourceViewAt(navigation, -100_000);
+    }
+    expect(navigation.zoom).toBe(SOURCE_VIEW_ZOOM_RANGE.max);
+    for (let i = 0; i < 10; i += 1) {
+      navigation = zoomSourceViewAt(navigation, 100_000);
+    }
+    expect(navigation.zoom).toBe(SOURCE_VIEW_ZOOM_RANGE.min);
+
+    navigation = panSourceViewBy(navigation, 100, -100);
+    expect(navigation.panX).toBe(SOURCE_VIEW_MAX_PAN);
+    expect(navigation.panY).toBe(-SOURCE_VIEW_MAX_PAN);
+    expect(
+      clampSourceViewNavigation({
+        zoom: Number.NaN,
+        panX: Infinity,
+        panY: Number.NaN,
+      })
+    ).toEqual(getDefaultSourceViewNavigation());
   });
 });

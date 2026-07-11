@@ -1,4 +1,5 @@
 import type { DepthStatus, PerfSettings } from '../types';
+import { getAutoMaxInflight, getSuggestedDepthLeadMs } from './depthSyncPolicy';
 import { getSessionStatus } from './sessionApi';
 
 export class DepthSyncController {
@@ -52,13 +53,14 @@ export class DepthSyncController {
             // Allow more inflight requests to cover network latency (Little's Law)
             // With high RTT, we need Inflight > Workers to keep the pipeline full.
             // Factor of 4 allows for RTT up to 4x the processing time.
-            const multiplier = perfSettings.mode === 'smooth'
-                ? 2
-                : perfSettings.mode === 'balanced'
-                  ? 3
-                  : 4;
-            const targetInflight = status.config.inference_workers * multiplier;
-            if (perfSettings.maxInflightRequests !== targetInflight) {
+            const targetInflight = getAutoMaxInflight(
+                perfSettings.mode,
+                status.config.inference_workers
+            );
+            if (
+                targetInflight !== null &&
+                perfSettings.maxInflightRequests !== targetInflight
+            ) {
                 this.updatePerfSettings({ maxInflightRequests: targetInflight });
                 console.debug(`[SyncController] Adjusted maxInflight to ${targetInflight}`);
             }
@@ -69,38 +71,18 @@ export class DepthSyncController {
         const stats = status.rolling_stats;
         if (!stats) return;
 
-        // Calculate ideal lead time
-        // lead = queue + decode + infer + safety
-        // safety margin: 50ms base + 10% of inference time
-        const safetyMargin = 0.05 + (stats.infer_avg_s * 0.1);
-        const totalProcessingS =
-            stats.queue_avg_s +
-            (stats.decode_avg_s || 0.05) +
-            stats.infer_avg_s +
-            safetyMargin;
-
-        let targetLeadMs = totalProcessingS * 1000;
-
-        // Ensure lead time is sufficient to keep all workers busy
-        // If we have N workers, we want to buffer at least N frames ahead?
-        // Or rather, we want to ensure we have enough "inflight" requests.
-        // If latency is L, and workers is W. Throughput = W/L.
-        // We need to request frames at rate W/L.
-        // To sustain this, our lead window must be large enough.
-        // Empirically, adding a "pipeline fill" component helps.
-        if (status.config && status.config.inference_workers) {
-            const minPipelineLead = status.config.inference_workers * 40; // 40ms per worker
-            targetLeadMs = Math.max(targetLeadMs, minPipelineLead);
-        }
-
-        // Clamp to reasonable limits [50ms, 2000ms]
-        // Increased max to 2000ms to allow for high worker counts
-        targetLeadMs = Math.max(50, Math.min(2000, targetLeadMs));
+        // Keep the disabled manual-lead value near the measured pipeline cost,
+        // so turning Auto Lead off starts from a useful value. Playback Auto
+        // Lead itself remains RTT + 100 ms in VideoDepthApp.
+        const targetLeadMs = getSuggestedDepthLeadMs(
+            stats,
+            status.config?.inference_workers ?? 0
+        );
 
         // Only update if difference is significant (> 20ms) to avoid React render thrashing
         if (Math.abs(targetLeadMs - perfSettings.depthLeadMs) > 20) {
-            this.updatePerfSettings({ depthLeadMs: Math.round(targetLeadMs) });
-            console.debug(`[SyncController] Adjusted lead to ${Math.round(targetLeadMs)}ms (infer=${stats.infer_avg_s.toFixed(3)}s)`);
+            this.updatePerfSettings({ depthLeadMs: targetLeadMs });
+            console.debug(`[SyncController] Adjusted lead to ${targetLeadMs}ms (infer=${stats.infer_avg_s.toFixed(3)}s)`);
         }
     }
 }

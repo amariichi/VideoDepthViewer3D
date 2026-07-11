@@ -118,6 +118,7 @@ async def depth_stream(
                 cached.z_min,
                 cached.z_max,
                 compress=settings.depth_compression_level > 0,
+                compression_level=settings.depth_compression_level,
                 encoding=depth_encoding,
             )
             pack_s = time.perf_counter() - pack_start
@@ -151,7 +152,11 @@ async def depth_stream(
         # Normalize decoded coded pixels into the same square-pixel display
         # coordinates used by the browser video texture. Rotation and SAR are
         # session metadata, so RGB and depth share one stable UV mapping.
+        normalize_start = time.perf_counter()
         frame = normalize_frame_for_display(frame, session.calibration)
+        normalize_s = time.perf_counter() - normalize_start
+        stats.add("normalize_s", normalize_s)
+        timings["normalize_s"] = normalize_s
 
         # Infer
         inflight_estimate = model.inflight_count + 1
@@ -212,6 +217,7 @@ async def depth_stream(
             cached_frame.z_min,
             cached_frame.z_max,
             compress=settings.depth_compression_level > 0,
+            compression_level=settings.depth_compression_level,
             encoding=depth_encoding,
         )
         pack_s = time.perf_counter() - pack_start
@@ -248,6 +254,7 @@ async def depth_stream(
                 "decode_s",
                 "infer_s",
                 "infer_wait_s",
+                "normalize_s",
                 "pack_s",
                 "ws_send_s",
                 "queue_wait_s",
@@ -362,13 +369,14 @@ async def depth_stream(
                         
                         if settings.profile_depth_timing:
                             profile_logger.info(
-                                "depth_timing session=%s time_ms=%.1f decode=%.3f infer=%.3f pack=%.3f send=%.3f queue=%.3f total=%.3f inflight=%d",
+                                "depth_timing session=%s time_ms=%.1f decode=%.3f normalize=%.3f infer=%.3f pack=%.3f send=%.3f queue=%.3f total=%.3f inflight=%d",
                                 session_id,
                                 timings.get(
                                     "frame_time_ms",
                                     timings.get("request_time_ms", 0.0),
                                 ),
                                 timings.get("decode_s", 0.0),
+                                timings.get("normalize_s", 0.0),
                                 timings.get("infer_s", 0.0),
                                 timings.get("pack_s", 0.0),
                                 timings.get("ws_send_s", 0.0),

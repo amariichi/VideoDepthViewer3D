@@ -80,6 +80,26 @@ def test_server_work_is_not_misclassified_as_network_latency() -> None:
     assert controller.state.limiting_stage == "inference"
 
 
+def test_normalize_and_pack_work_are_not_misclassified_as_network_latency() -> None:
+    controller = make_controller("quality")
+
+    controller.observe(
+        QualityMetrics(
+            infer_s=0.01,
+            normalize_s=0.24,
+            pack_s=0.30,
+            send_s=0.001,
+            latency_ms=600,
+            worker_count=4,
+        )
+    )
+
+    assert controller.state.encoding == "linear16"
+    assert controller.state.downsample_factor == 1
+    assert controller.state.process_res == 960
+    assert controller.state.limiting_stage == "stable"
+
+
 def test_applied_fps_can_trade_depth_resolution_for_smoothness() -> None:
     controller = make_controller("balanced")
 

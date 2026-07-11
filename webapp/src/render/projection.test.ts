@@ -119,4 +119,44 @@ describe('projection controls', () => {
       12
     );
   });
+
+  it('applies one shared view-window pan without changing stereo separation', () => {
+    const left = getOffAxisFrustum(50, 1, 0.1, 100, -0.032, 3.5);
+    const right = getOffAxisFrustum(50, 1, 0.1, 100, 0.032, 3.5);
+    const pannedLeft = getOffAxisFrustum(
+      50,
+      1,
+      0.1,
+      100,
+      -0.032,
+      3.5,
+      0.25,
+      -0.4
+    );
+    const pannedRight = getOffAxisFrustum(
+      50,
+      1,
+      0.1,
+      100,
+      0.032,
+      3.5,
+      0.25,
+      -0.4
+    );
+
+    expect(
+      pannedLeft.left + pannedLeft.right - (left.left + left.right)
+    ).toBeCloseTo(
+      pannedRight.left + pannedRight.right - (right.left + right.right),
+      12
+    );
+    expect(pannedLeft.top + pannedLeft.bottom).not.toBeCloseTo(0, 12);
+    expect(
+      (pannedLeft.left + pannedLeft.right) -
+        (pannedRight.left + pannedRight.right)
+    ).toBeCloseTo(
+      (left.left + left.right) - (right.left + right.right),
+      12
+    );
+  });
 });

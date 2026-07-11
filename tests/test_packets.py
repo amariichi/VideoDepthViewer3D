@@ -59,6 +59,31 @@ def test_pack_depth_payload_compressed_body_round_trip() -> None:
     assert np.frombuffer(raw, dtype="<u2").size == depth.size
 
 
+def test_pack_depth_payload_uses_requested_compression_level(monkeypatch) -> None:
+    depth = np.arange(64, dtype=np.float32).reshape(8, 8)
+    original_compress = zlib.compress
+    observed_levels: list[int] = []
+
+    def record_level(data: bytes, level: int = -1) -> bytes:
+        observed_levels.append(level)
+        return original_compress(data, level=level)
+
+    monkeypatch.setattr("backend.utils.packets.zlib.compress", record_level)
+
+    payload = pack_depth_payload(
+        depth.copy(),
+        50.0,
+        0.0,
+        63.0,
+        compress=True,
+        compression_level=7,
+    )
+
+    assert observed_levels == [7]
+    assert HEADER_STRUCT.unpack_from(payload.buffer)[0] == b"VDZ2"
+    assert np.frombuffer(zlib.decompress(payload.buffer[HEADER_SIZE:]), dtype="<u2").size == depth.size
+
+
 def test_log8_quantization_has_bounded_relative_error() -> None:
     source = np.geomspace(0.5, 50.0, 4096, dtype=np.float32).reshape(64, 64)
     encoded, scale, bias = quantize_depth_log8(source.copy(), 0.5, 50.0)

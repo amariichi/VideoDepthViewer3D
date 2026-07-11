@@ -65,23 +65,26 @@ def pack_depth_payload(
     z_min: float,
     z_max: float,
     compress: bool = True,
+    compression_level: int = 1,
     encoding: DepthEncoding = "linear16",
 ) -> DepthPayload:
     settings = get_settings()
+    level = min(max(int(compression_level), 0), 9) if compress else 0
+    is_compressed = level > 0
     if encoding == "log8":
         encoded, scale, bias = quantize_depth_log8(depth, z_min, z_max)
         data_type = DATA_TYPE_UINT8_LOG
         version = 2
-        magic = b"VDZ4" if compress else b"VDZ3"
+        magic = b"VDZ4" if is_compressed else b"VDZ3"
     else:
         encoded, scale, bias = quantize_depth(depth, z_min, z_max)
         data_type = DATA_TYPE_UINT16
         version = 1
-        magic = b"VDZ2" if compress else settings.depth_header_magic
+        magic = b"VDZ2" if is_compressed else settings.depth_header_magic
 
     raw_bytes = encoded.tobytes()
-    if compress:
-        payload_bytes = zlib.compress(raw_bytes, level=1)  # Level 1 is fastest
+    if is_compressed:
+        payload_bytes = zlib.compress(raw_bytes, level=level)
     else:
         payload_bytes = raw_bytes
 

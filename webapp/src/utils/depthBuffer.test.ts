@@ -28,6 +28,18 @@ describe('DepthBuffer', () => {
     expect(buffer.getFrame(200)).toBeNull();
   });
 
+  it('returns a bounded nearest-frame window for entry-time stabilization', () => {
+    const buffer = new DepthBuffer();
+    [0, 100, 200, 300, 900, 1500].forEach((timestamp) => {
+      buffer.add(frame(timestamp));
+    });
+
+    expect(
+      buffer.getFramesNear(250, 400, 3).map((item) => item.timestampMs)
+    ).toEqual([200, 300, 100]);
+    expect(buffer.getFramesNear(Number.NaN)).toEqual([]);
+  });
+
   it('does not reserve an entire look-ahead window before flow control', () => {
     vi.spyOn(performance, 'now').mockReturnValue(1000);
     const buffer = new DepthBuffer();

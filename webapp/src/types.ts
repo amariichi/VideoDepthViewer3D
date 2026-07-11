@@ -59,6 +59,8 @@ export interface DepthStatus extends SessionInfo {
     client_fps?: number;
     infer_avg_s: number;
     infer_wait_avg_s?: number;
+    normalize_avg_s?: number;
+    pack_avg_s?: number;
     queue_avg_s: number;
     ws_send_avg_s: number;
     decode_avg_s?: number;

@@ -15,8 +15,12 @@ declare module '@lookingglass/webxr' {
   export interface LookingGlassGlobalConfig extends LookingGlassViewConfig {
     calibration?: {
       serial?: string;
+      screenW?: { value?: number };
+      screenH?: { value?: number };
     };
     popup?: Window | null;
+    lkgCanvas?: HTMLCanvasElement | null;
+    appCanvas?: HTMLCanvasElement | null;
   }
 
   export class LookingGlassWebXRPolyfill
