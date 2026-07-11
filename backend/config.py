@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+
+def _default_inference_worker_count(platform: str | None = None) -> int:
+    """Use a conservative default under Windows' WDDM scheduler."""
+
+    return 2 if (platform or sys.platform) == "win32" else 3
 
 
 class Settings(BaseSettings):
@@ -20,7 +27,12 @@ class Settings(BaseSettings):
         validation_alias="VIDEO_DEPTH_MODEL_ID",
     )
     depth_process_res: int = Field(default=640, validation_alias="VIDEO_DEPTH_PROCESS_RES")
-    device: str = "cuda"
+    source_fov_y: float = Field(default=50.0, validation_alias="VIDEO_DEPTH_SOURCE_FOV_Y")
+    metric_reference_focal_px: float = Field(
+        default=300.0,
+        validation_alias="VIDEO_DEPTH_METRIC_REFERENCE_FOCAL_PX",
+    )
+    device: str = Field(default="auto", validation_alias="VIDEO_DEPTH_DEVICE")
     max_queue_size: int = 4
     depth_width: int = 640
     depth_height: int = 360
@@ -30,8 +42,17 @@ class Settings(BaseSettings):
     profile_depth_timing: bool = Field(default=False, validation_alias="VIDEO_DEPTH_PROFILE_TIMING")
     depth_downsample_factor: int = Field(default=1, validation_alias="VIDEO_DEPTH_DOWNSAMPLE")
     depth_compression_level: int = Field(default=0, validation_alias="VIDEO_DEPTH_COMPRESSION")
+    depth_encoding: str = Field(default="log8", validation_alias="VIDEO_DEPTH_ENCODING")
+    optimization_mode: str = Field(
+        default="balanced",
+        validation_alias="VIDEO_DEPTH_OPTIMIZATION_MODE",
+    )
     uv_cache_dir: Path | None = None
-    inference_worker_count: int = Field(default=3, validation_alias="VIDEO_DEPTH_INFER_WORKERS")
+    inference_worker_count: int = Field(
+        default_factory=_default_inference_worker_count,
+        validation_alias="VIDEO_DEPTH_INFER_WORKERS",
+    )
+    decoder_worker_count: int = Field(default=4, validation_alias="VIDEO_DEPTH_DECODER_WORKERS")
     log_level: str = Field(default="WARNING", validation_alias="VIDEO_DEPTH_LOG_LEVEL")
     clear_cache_override: bool = Field(default=False, validation_alias="VIDEO_DEPTH_CLEAR_CACHE")
 

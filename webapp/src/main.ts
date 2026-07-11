@@ -6,4 +6,7 @@ if (!root) {
   throw new Error('Root element not found');
 }
 
-new VideoDepthApp(root);
+const app = new VideoDepthApp(root);
+if (import.meta.env.DEV) {
+  (window as typeof window & { __videoDepthApp?: VideoDepthApp }).__videoDepthApp = app;
+}

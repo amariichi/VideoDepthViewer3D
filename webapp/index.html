@@ -3,7 +3,6 @@
 
 <head>
   <meta charset="UTF-8" />
-  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>VideoDepthViewer3D</title>
 </head>
@@ -40,10 +39,19 @@
         <span>Swap L/R</span>
       </label>
 
-      <!-- VR / Experimental Group (Next to SBS) -->
-      <div class="flex items-center gap-3 ml-2 pl-4 border-l-2 border-tropical-muted/20">
+      <!-- XR / Holographic output group -->
+      <div class="flex flex-wrap items-center gap-3 ml-2 pl-4 border-l-2 border-tropical-muted/20">
+        <div class="flex items-center gap-2">
+          <button id="btn-looking-glass" type="button" aria-describedby="looking-glass-status"
+            class="border border-tropical-primary text-tropical-primary px-3 py-1.5 rounded text-sm font-medium hover:bg-tropical-primary hover:text-white disabled:opacity-40 disabled:cursor-not-allowed">
+            Enter Looking Glass
+          </button>
+          <span id="looking-glass-status" role="status" aria-live="polite"
+            class="max-w-xs text-pretty text-xs text-tropical-muted">Monitor</span>
+        </div>
+
         <button id="btn-vr"
-          class="border border-tropical-muted text-tropical-muted px-3 py-1.5 rounded hover:bg-tropical-muted hover:text-white transition-colors text-sm">
+          class="border border-tropical-muted text-tropical-muted px-3 py-1.5 rounded hover:bg-tropical-muted hover:text-white disabled:opacity-40 disabled:cursor-not-allowed text-sm">
           Start VR (RawXR)
         </button>
 

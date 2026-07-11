@@ -10,8 +10,12 @@ import av
 import numpy as np
 import threading
 
-
 from backend.utils.frame_info import FrameInfo, frame_info_from_av
+from backend.utils.calibration import (
+    expanded_square_pixel_dimensions,
+    normalize_rotation_degrees,
+    square_pixel_dimensions,
+)
 
 
 class EndOfStreamError(Exception):
@@ -38,10 +42,22 @@ class VideoMetadata:
     frames: Optional[int]
     fps: float
     duration_ms: Optional[float]
+    sample_aspect_ratio_numerator: int
+    sample_aspect_ratio_denominator: int
+    rotation_degrees: int
+    display_width: int
+    display_height: int
+    inference_width: int
+    inference_height: int
 
     @property
     def aspect(self) -> float:
-        return self.width / self.height if self.height else 1.0
+        return self.display_width / self.display_height if self.display_height else 1.0
+
+    @property
+    def pixel_aspect_ratio(self) -> float:
+        denominator = self.sample_aspect_ratio_denominator or 1
+        return self.sample_aspect_ratio_numerator / denominator
 
 
 class FrameDecoder:
@@ -50,25 +66,71 @@ class FrameDecoder:
     SEEK_PAD_MS = 0.0
     STREAM_WINDOW_MS = 1000.0
     MAX_SCAN_FRAMES = 360
+    TIMESTAMP_EPSILON_MS = 1.0
 
     def __init__(self, source: Path) -> None:
         self.source = source
         self._container = av.open(str(source))
         self._stream = self._container.streams.video[0]
+        # Frame + slice threading improves high-resolution software decode.
+        # DecoderPool concurrency is bounded separately to avoid oversubscription.
+        self._stream.thread_type = "AUTO"
         self._frame_iter: Optional[Iterator] = None
         self._last_frame_time_ms: Optional[float] = None
+        self._rotation_degrees: Optional[int] = None
 
     def metadata(self) -> VideoMetadata:
         stream = self._stream
         fps = float(stream.average_rate) if stream.average_rate else 30.0
         duration_ms = float(stream.duration * stream.time_base * 1000) if stream.duration else None
+        sar = stream.sample_aspect_ratio
+        sar_numerator = int(sar.numerator) if sar and sar.numerator else 1
+        sar_denominator = int(sar.denominator) if sar and sar.denominator else 1
+        rotation = self._probe_rotation()
+        if rotation in (90, 270):
+            rotated_width, rotated_height = stream.height, stream.width
+            display_sar = sar_denominator / sar_numerator
+        else:
+            rotated_width, rotated_height = stream.width, stream.height
+            display_sar = sar_numerator / sar_denominator
+        display_width, display_height = expanded_square_pixel_dimensions(
+            rotated_width,
+            rotated_height,
+            display_sar,
+        )
+        inference_width, inference_height = square_pixel_dimensions(
+            rotated_width,
+            rotated_height,
+            display_sar,
+        )
         return VideoMetadata(
             width=stream.width,
             height=stream.height,
             frames=stream.frames or None,
             fps=fps,
             duration_ms=duration_ms,
+            sample_aspect_ratio_numerator=sar_numerator,
+            sample_aspect_ratio_denominator=sar_denominator,
+            rotation_degrees=rotation,
+            display_width=display_width,
+            display_height=display_height,
+            inference_width=inference_width,
+            inference_height=inference_height,
         )
+
+    def _probe_rotation(self) -> int:
+        if self._rotation_degrees is not None:
+            return self._rotation_degrees
+        rotation = 0
+        try:
+            with av.open(str(self.source)) as container:
+                stream = container.streams.video[0]
+                frame = next(container.decode(stream))
+                rotation = normalize_rotation_degrees(getattr(frame, "rotation", 0))
+        except (StopIteration, OSError, av.error.FFmpegError):
+            rotation = 0
+        self._rotation_degrees = rotation
+        return rotation
 
     def decode_at(self, time_ms: float) -> tuple[np.ndarray, FrameInfo]:
         """Decode the frame nearest to the requested timestamp (ms).
@@ -142,7 +204,11 @@ class FrameDecoder:
             frames_examined += 1
             actual_time = info.time_ms if info.time_ms >= 0 else time_ms
             self._last_frame_time_ms = actual_time
-            if info.time_ms < 0 or actual_time >= time_ms or frames_examined >= self.MAX_SCAN_FRAMES:
+            if (
+                info.time_ms < 0
+                or actual_time + self.TIMESTAMP_EPSILON_MS >= time_ms
+                or frames_examined >= self.MAX_SCAN_FRAMES
+            ):
                 return frame.to_ndarray(format="rgb24"), info
 
 

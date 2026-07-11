@@ -33,6 +33,9 @@ jobs:
       - name: Frontend lint
         run: npm run lint
 
+      - name: Frontend tests
+        run: npm test
+
       - name: Frontend build
         run: npm run build
 
@@ -50,8 +53,21 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Verify FFmpeg tools
+        run: |
+          ffmpeg -version
+          ffprobe -version
+
       - name: Backend lint
-        run: uv run --extra dev python -m ruff check backend scripts
+        run: uv run --locked --extra dev python -m ruff check backend scripts tests
 
       - name: Backend syntax check
-        run: python3 -m py_compile $(find backend scripts -name '*.py' -type f)
+        run: python3 -m compileall -q backend scripts tests
+
+      - name: Backend tests
+        run: uv run --locked --extra dev --extra inference pytest -q

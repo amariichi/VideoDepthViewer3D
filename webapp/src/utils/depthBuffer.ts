@@ -6,8 +6,14 @@ export class DepthBuffer {
     private readonly toleranceMs = 33; // Match frame duration roughly
 
     add(frame: DepthFrame) {
-        // Remove from requested set
-        this.requested.delete(frame.timestampMs);
+        // The backend returns the decoded frame PTS, which can differ slightly
+        // from the requested fractional frame-grid timestamp. Clear the matching
+        // request by tolerance instead of relying on exact float equality.
+        for (const timestamp of this.requested.keys()) {
+            if (Math.abs(timestamp - frame.timestampMs) <= this.toleranceMs / 2) {
+                this.requested.delete(timestamp);
+            }
+        }
 
         // Insert into sorted frames
         // Binary search for insertion point could be faster, but array is small (buffer size ~100)
@@ -61,6 +67,28 @@ export class DepthBuffer {
         return bestFrame;
     }
 
+    getFramesNear(
+        timeMs: number,
+        maxDistanceMs = 1000,
+        maxFrames = 7
+    ): DepthFrame[] {
+        if (!Number.isFinite(timeMs)) return [];
+        const distance = Number.isFinite(maxDistanceMs)
+            ? Math.max(maxDistanceMs, 0)
+            : 1000;
+        const limit = Number.isFinite(maxFrames)
+            ? Math.max(1, Math.floor(maxFrames))
+            : 7;
+        return this.frames
+            .filter((frame) => Math.abs(frame.timestampMs - timeMs) <= distance)
+            .sort(
+                (a, b) =>
+                    Math.abs(a.timestampMs - timeMs) -
+                    Math.abs(b.timestampMs - timeMs)
+            )
+            .slice(0, limit);
+    }
+
     getMissing(startMs: number, endMs: number, stepMs: number, timeoutMs: number): number[] {
         const missing: number[] = [];
         const now = performance.now();
@@ -85,9 +113,14 @@ export class DepthBuffer {
             }
 
             missing.push(t);
-            this.requested.set(t, now); // Mark as requested immediately
         }
         return missing;
+    }
+
+    markRequested(timestamps: readonly number[], requestTime = performance.now()): void {
+        for (const timestamp of timestamps) {
+            this.requested.set(timestamp, requestTime);
+        }
     }
 
     cleanup(currentTimeMs: number) {

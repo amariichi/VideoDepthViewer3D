@@ -5,6 +5,21 @@ __pycache__/
 .venv/
 .uv-cache/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets and machine-specific agent settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.agent/
+.claude/settings.local.json
 
 # Node.js
 node_modules/
@@ -25,4 +40,5 @@ Thumbs.db
 
 # Project specific
 tmp/
+.playwright-cli/
 backend_stats.txt

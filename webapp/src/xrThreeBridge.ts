@@ -32,9 +32,10 @@ export function drawThreeStereo(
 
     const cam = cams[i] || cams[0];
     cam.projectionMatrix.fromArray(view.projectionMatrix as unknown as number[]);
-    const viewMat = new THREE.Matrix4().fromArray(view.transform.matrix as unknown as number[]);
-    const camMat = viewMat.invert();
-    cam.matrix.copy(camMat);
+    // XRView.transform is already the camera world transform. Three.js computes
+    // matrixWorldInverse from it during render; pre-inverting here applies the
+    // view transform twice.
+    cam.matrix.fromArray(view.transform.matrix as unknown as number[]);
     cam.matrix.decompose(cam.position, cam.quaternion, cam.scale);
     cam.updateMatrixWorld(true);
 
