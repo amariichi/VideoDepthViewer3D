@@ -96,6 +96,36 @@ describe('foreground safety depth occupancy', () => {
     expect(quantiles?.[1]).toBeCloseTo(25.75, 5);
     expect(quantiles?.[2]).toBeCloseTo(50.5, 5);
   });
+
+  it('spends the fixed sample budget inside the visible source region', () => {
+    const quantiles = estimateRenderedDepthQuantiles(
+      depthFrame([
+        ...new Array(50).fill(1),
+        ...new Array(50).fill(10),
+      ]),
+      metricControls,
+      100,
+      [0.2, 0.5],
+      100,
+      { minU: 0.5, maxU: 1, minV: 0, maxV: 1 }
+    );
+
+    expect(quantiles).toEqual([10, 10]);
+  });
+
+  it('holds automatic placement when a cropped region has too few samples', () => {
+    const quantiles = estimateRenderedDepthQuantiles(
+      depthFrame(new Array(100).fill(2)),
+      metricControls,
+      100,
+      [0.2],
+      100,
+      { minU: 0.99, maxU: 1, minV: 0, maxV: 1 },
+      4
+    );
+
+    expect(quantiles).toBeNull();
+  });
 });
 
 describe('mode-specific rigid pushback', () => {

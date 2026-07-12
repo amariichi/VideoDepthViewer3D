@@ -16,7 +16,6 @@ import { perfStats } from './utils/perfStats';
 import { apiUrl } from './utils/env';
 import { getModeTargetTriangles } from './performance/qualityPolicy';
 import { getProjectionCalibration } from './render/projection';
-import { LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS } from './render/frontSafety';
 import { estimateSourcePivotDepth } from './render/sourceView';
 import {
   DEFAULT_LOOKING_GLASS_FOV_Y,
@@ -37,7 +36,10 @@ import type {
   LookingGlassSourceFit,
   LookingGlassViewControls,
 } from './lookingGlass';
-import { getLookingGlassWheelZoom } from './lookingGlassInteraction';
+import {
+  LookingGlassFocusClickGuard,
+  getLookingGlassWheelZoom,
+} from './lookingGlassInteraction';
 
 type XRDisplayMode = 'vr' | 'looking-glass';
 
@@ -69,6 +71,8 @@ export class VideoDepthApp {
   private lookingGlassEntryPivotSampleCount = 0;
   private lookingGlassSourceFit: LookingGlassSourceFit | null = null;
   private lookingGlassPresentationCleanup: (() => void) | null = null;
+  private readonly lookingGlassFocusClickGuard =
+    new LookingGlassFocusClickGuard();
   private suppressSeekRefresh = false;
   private lastAppliedDepthTimestamp = -1;
   private currentSyncDeltaMs = 0;
@@ -108,6 +112,8 @@ export class VideoDepthApp {
         getLookingGlassEffectiveTargetZ: () =>
           this.rawXR?.getAutoConvergenceTargetZ() ??
           getLookingGlassTargetZ(this.lookingGlassViewControls),
+        getLookingGlassManualFocusLocked: () =>
+          this.rawXR?.isLookingGlassManualFocusLocked() ?? false,
         getLookingGlassSourceDepthScale: () =>
           this.rawXR?.getLookingGlassSourceDepthScale() ?? 1,
         getViewDistance: () => this.renderScene.getViewDistance(),
@@ -116,6 +122,16 @@ export class VideoDepthApp {
         onModelZOffsetChanged: (offset) => this.renderScene.setModelZOffset(offset),
         onLookingGlassViewChanged: (controls) => {
           this.setLookingGlassViewControls(controls, true);
+        },
+        onLookingGlassResumeAuto: () => {
+          this.lookingGlassFocusClickGuard.reset();
+          const resumed =
+            this.rawXR?.resumeLookingGlassAutoConvergence() ?? false;
+          this.controlPanel.updateStatus(
+            resumed
+              ? 'Looking Glass automatic depth placement resumed'
+              : 'Looking Glass automatic depth placement is already active'
+          );
         },
         onLookingGlassRefitForeground: () => {
           if (this.lookingGlassSourceFit) {
@@ -255,6 +271,9 @@ export class VideoDepthApp {
     const autoChanged =
       clamped.autoConvergence !==
       this.lookingGlassViewControls.autoConvergence;
+    if (autoChanged) {
+      this.lookingGlassFocusClickGuard.reset();
+    }
     const viewerControls = this.getEffectiveViewerControls();
     const sourceConvergenceActive =
       this.lookingGlassSourceFit !== null &&
@@ -342,8 +361,6 @@ export class VideoDepthApp {
         const applied = this.rawXR?.setManualLookingGlassConvergenceTarget(
           nextTargetZ,
           requestedFocusChanged && clamped.autoConvergence
-            ? LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS
-            : 0
         );
         if (applied?.limited) {
           convergenceLimited = true;
@@ -531,6 +548,32 @@ export class VideoDepthApp {
     }
 
     const requestedFocusBaseZ = pick.point.z;
+    const viewConfig = toLookingGlassViewConfig(
+      this.lookingGlassViewControls,
+      this.lookingGlassBaseTargetDiameter
+    );
+    const projectionScale = getLookingGlassPresentationScale(
+      this.lookingGlassSourceFit?.projectionScale ?? 1,
+      this.lookingGlassViewControls.zoom
+    );
+    const activeTargetDiameter =
+      (viewConfig.targetDiam ?? DEFAULT_LOOKING_GLASS_TARGET_DIAMETER) /
+      projectionScale;
+    const clickDecision = this.lookingGlassFocusClickGuard.evaluate({
+      ...input,
+      requestedTargetZ: requestedFocusBaseZ,
+      currentTargetZ:
+        this.rawXR?.getAutoConvergenceTargetZ() ??
+        getLookingGlassTargetZ(this.lookingGlassViewControls),
+      targetDiameter: activeTargetDiameter,
+    });
+    if (clickDecision.action === 'confirm-far-focus') {
+      this.controlPanel.updateStatus(
+        'Far focus not applied (possible misclick). Click the same area again after a moment to confirm.'
+      );
+      return;
+    }
+
     const controls = clampLookingGlassViewControls({
       ...this.lookingGlassViewControls,
       focusBaseZ: requestedFocusBaseZ,
@@ -554,12 +597,17 @@ export class VideoDepthApp {
       baselineLimited ? 'convergence range' : null,
       focusCompensationLimited ? 'framing compensation' : null,
     ].filter((value): value is string => value !== null);
+    const manualFocusLocked =
+      this.rawXR?.isLookingGlassManualFocusLocked() ?? false;
+    const placementState = manualFocusLocked
+      ? 'focus locked; Resume Auto or a scene/safety change releases it'
+      : controls.autoConvergence
+        ? 'automatic depth placement active'
+        : 'manual placement held';
     this.controlPanel.updateStatus(
       limitations.length > 0
-        ? `Looking Glass target Z ${appliedTargetZ.toFixed(2)} (${limitations.join(' and ')} limited)`
-        : controls.autoConvergence
-          ? `Looking Glass target Z ${appliedTargetZ.toFixed(2)}; auto placement held up to 4 s`
-          : `Looking Glass target Z ${appliedTargetZ.toFixed(2)}; manual placement held`
+        ? `Looking Glass target Z ${appliedTargetZ.toFixed(2)} (${limitations.join(' and ')} limited); ${placementState}`
+        : `Looking Glass target Z ${appliedTargetZ.toFixed(2)}; ${placementState}`
     );
   }
 
@@ -577,6 +625,7 @@ export class VideoDepthApp {
   private detachLookingGlassPresentationInput(): void {
     this.lookingGlassPresentationCleanup?.();
     this.lookingGlassPresentationCleanup = null;
+    this.lookingGlassFocusClickGuard.reset();
   }
 
   private mountXRButtons(): void {
@@ -790,7 +839,7 @@ export class VideoDepthApp {
               : '';
             setLookingGlassStatus(
               'Active',
-              `Bridge calibration is active.${fitSummary} Wheel to zoom; click stable depth to focus.`
+              `Bridge calibration is active.${fitSummary} Wheel to zoom; click stable depth to lock focus; use Resume Auto to release it.`
             );
             this.controlPanel.updateStatus(
               fit

@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Matrix4, Vector3, Vector4 } from 'three';
 import type { DepthFrame, ViewerControls } from './types';
-import { AutoConvergenceController } from './render/frontSafety';
+import {
+  AutoConvergenceController,
+  FrontSafetyController,
+  type NormalizedDepthSampleRegion,
+} from './render/frontSafety';
 import {
   RawXRTest,
   clampLookingGlassConvergenceTarget,
   getLookingGlassConvergenceBaselineScale,
+  getLookingGlassVisibleDepthSampleRegion,
   getXRSessionDepthNear,
   releaseXRPresentationState,
   scaleModelAboutSourceApex,
@@ -14,6 +19,26 @@ import {
   shouldInitializeDepthMesh,
   shouldUseLookingGlassFixedSourceProjection,
 } from './xrTest';
+
+interface FrontSafeModelTestApi {
+  getFrontSafeModel(
+    baseModel: Matrix4,
+    depthFrame: DepthFrame,
+    effective: {
+      zScale: number;
+      zBias: number;
+      zGamma: number;
+      planeScale: number;
+    },
+    zMaxClip: number,
+    fixedSourceProjectionActive: boolean,
+    activeTargetDiameter: number,
+    visibleDepthRegion?: NormalizedDepthSampleRegion | null
+  ): Matrix4;
+  manualFocusLockActive: boolean;
+  lastAutoConvergenceFrontBoundaryZ: number | null;
+  lastAutoConvergenceDepthTimestamp: number;
+}
 
 describe('shouldInitializeDepthMesh', () => {
   it('recovers when startup selected mesh before GPU resources existed', () => {
@@ -143,6 +168,108 @@ describe('Looking Glass source projection boundary', () => {
 });
 
 describe('Looking Glass immediate foreground recovery', () => {
+  function makeManualHoldRaw(
+    previousFrontBoundaryZ: number
+  ): {
+    raw: RawXRTest;
+    privateRaw: FrontSafeModelTestApi;
+  } {
+    const convergence = new AutoConvergenceController();
+    const now = performance.now();
+    const raw = Object.create(RawXRTest.prototype) as RawXRTest;
+    Object.assign(raw, {
+      frontSafetyProfile: {
+        mode: 'looking-glass',
+        targetZ: 0,
+        targetDiameter: 1,
+        preserveSourceProjection: true,
+        autoConvergence: true,
+      },
+      frontSafety: new FrontSafetyController(),
+      autoConvergence: convergence,
+      manualFocusLockActive: false,
+      autoConvergenceFastUntilMs: 0,
+      lastAutoConvergenceFrontBoundaryZ: previousFrontBoundaryZ,
+      lastAutoConvergenceDepthTimestamp: -1,
+      lookingGlassSourceDepthScale: 1,
+      lastLookingGlassSourceDepthRebaseTimestamp: -1,
+      lastFrontSafetySampleMs: 0,
+      lastFrontSafetyFrameMs: now - 100,
+    });
+    raw.setManualLookingGlassConvergenceTarget(0.5, true);
+    return {
+      raw,
+      privateRaw: raw as unknown as FrontSafeModelTestApi,
+    };
+  }
+
+  function renderManualHoldFrame(
+    privateRaw: ReturnType<typeof makeManualHoldRaw>['privateRaw'],
+    timestampMs: number
+  ): void {
+    privateRaw.getFrontSafeModel(
+      new Matrix4().makeTranslation(0, 0, 1),
+      {
+        timestampMs,
+        width: 100,
+        height: 1,
+        data: new Float32Array(100).fill(1),
+        scale: 1,
+        bias: 0,
+        zMax: 50,
+      },
+      { zScale: 1, zBias: 0, zGamma: 1, planeScale: 2 },
+      50,
+      true,
+      1
+    );
+  }
+
+  it('keeps a near click locked when unchanged depth only looks all-behind', () => {
+    const { raw, privateRaw } = makeManualHoldRaw(0);
+
+    renderManualHoldFrame(privateRaw, 11_000);
+
+    expect(raw.getAutoConvergenceTargetZ()).toBeCloseTo(0.5, 12);
+    expect(privateRaw.manualFocusLockActive).toBe(true);
+  });
+
+  it('resumes automatic convergence explicitly after a persistent lock', () => {
+    const { raw, privateRaw } = makeManualHoldRaw(0);
+
+    expect(raw.resumeLookingGlassAutoConvergence()).toBe(true);
+    expect(privateRaw.manualFocusLockActive).toBe(false);
+    expect(raw.resumeLookingGlassAutoConvergence()).toBe(false);
+  });
+
+  it('keeps a manual focus lock when zoom or pan changes the sample window', () => {
+    const { raw, privateRaw } = makeManualHoldRaw(0.25);
+
+    raw.setFrontSafetyProfile({
+      mode: 'looking-glass',
+      targetZ: 0,
+      targetDiameter: 1,
+      projectionScale: 2,
+      projectionPanX: 0.5,
+      projectionPanY: 0,
+      preserveSourceProjection: true,
+      autoConvergence: true,
+    });
+
+    expect(raw.isLookingGlassManualFocusLocked()).toBe(true);
+    expect(raw.getAutoConvergenceTargetZ()).toBeCloseTo(0.5, 12);
+    expect(privateRaw.lastAutoConvergenceFrontBoundaryZ).toBeNull();
+  });
+
+  it('still releases a manual hold for a real depth-boundary cut', () => {
+    const { raw, privateRaw } = makeManualHoldRaw(0.6);
+
+    renderManualHoldFrame(privateRaw, 12_000);
+
+    expect(raw.getAutoConvergenceTargetZ()).toBeLessThan(0.5);
+    expect(privateRaw.manualFocusLockActive).toBe(false);
+  });
+
   it('snaps q20 on the first new depth frame before the normal sample cadence', () => {
     const convergence = new AutoConvergenceController();
     convergence.reset(-0.5);
@@ -165,7 +292,7 @@ describe('Looking Glass immediate foreground recovery', () => {
         autoConvergence: true,
       },
       autoConvergence: convergence,
-      autoConvergencePausedUntilMs: performance.now() + 4_000,
+      manualFocusLockActive: true,
       autoConvergenceFastUntilMs: 0,
       lastAutoConvergenceFrontBoundaryZ: -0.5,
       lastAutoConvergenceDepthTimestamp: -1,
@@ -176,23 +303,7 @@ describe('Looking Glass immediate foreground recovery', () => {
       lastFrontSafetySampleMs: performance.now(),
       lastFrontSafetyFrameMs: performance.now(),
     });
-    const privateRaw = raw as unknown as {
-      getFrontSafeModel(
-        baseModel: Matrix4,
-        depthFrame: DepthFrame,
-        effective: {
-          zScale: number;
-          zBias: number;
-          zGamma: number;
-          planeScale: number;
-        },
-        zMaxClip: number,
-        fixedSourceProjectionActive: boolean,
-        activeTargetDiameter: number
-      ): Matrix4;
-      lastAutoConvergenceDepthTimestamp: number;
-      autoConvergencePausedUntilMs: number;
-    };
+    const privateRaw = raw as unknown as FrontSafeModelTestApi;
 
     privateRaw.getFrontSafeModel(
       new Matrix4().makeTranslation(0, 0, 1),
@@ -205,7 +316,58 @@ describe('Looking Glass immediate foreground recovery', () => {
 
     expect(raw.getAutoConvergenceTargetZ()).toBeCloseTo(0.5, 12);
     expect(privateRaw.lastAutoConvergenceDepthTimestamp).toBe(12_000);
-    expect(privateRaw.autoConvergencePausedUntilMs).toBe(0);
+    expect(privateRaw.manualFocusLockActive).toBe(false);
+  });
+
+  it('uses only the visible crop for immediate q20 recovery', () => {
+    const convergence = new AutoConvergenceController();
+    convergence.reset(-0.5);
+    const depth: DepthFrame = {
+      timestampMs: 13_000,
+      width: 200,
+      height: 1,
+      data: new Float32Array([
+        ...new Array(100).fill(0.25),
+        ...new Array(100).fill(1),
+      ]),
+      scale: 1,
+      bias: 0,
+      zMax: 50,
+    };
+    const raw = Object.create(RawXRTest.prototype) as RawXRTest;
+    Object.assign(raw, {
+      frontSafetyProfile: {
+        mode: 'looking-glass',
+        targetZ: 0,
+        targetDiameter: 0.1,
+        projectionScale: 1,
+        preserveSourceProjection: true,
+        autoConvergence: true,
+      },
+      autoConvergence: convergence,
+      manualFocusLockActive: true,
+      autoConvergenceFastUntilMs: 0,
+      lastAutoConvergenceFrontBoundaryZ: -0.5,
+      lastAutoConvergenceDepthTimestamp: -1,
+      lookingGlassSourceDepthScale: 1,
+      lastLookingGlassSourceDepthRebaseTimestamp: -1,
+      lastFrontSafetySampleMs: performance.now(),
+      lastFrontSafetyFrameMs: performance.now(),
+    });
+    const privateRaw = raw as unknown as FrontSafeModelTestApi;
+
+    privateRaw.getFrontSafeModel(
+      new Matrix4().makeTranslation(0, 0, 1),
+      depth,
+      { zScale: 1, zBias: 0, zGamma: 1, planeScale: 2 },
+      50,
+      true,
+      0.1,
+      { minU: 0.5, maxU: 1, minV: 0, maxV: 1 }
+    );
+
+    expect(raw.getAutoConvergenceTargetZ()).toBeCloseTo(0, 12);
+    expect(privateRaw.manualFocusLockActive).toBe(false);
   });
 
   it('rebases the measured 7-second q1 behind the vendor near plane', () => {
@@ -240,7 +402,7 @@ describe('Looking Glass immediate foreground recovery', () => {
         autoConvergence: false,
       },
       autoConvergence: new AutoConvergenceController(),
-      autoConvergencePausedUntilMs: 0,
+      manualFocusLockActive: false,
       autoConvergenceFastUntilMs: 0,
       lastAutoConvergenceFrontBoundaryZ: null,
       lastAutoConvergenceDepthTimestamp: -1,
@@ -249,21 +411,7 @@ describe('Looking Glass immediate foreground recovery', () => {
       lastFrontSafetySampleMs: 0,
       lastFrontSafetyFrameMs: performance.now(),
     });
-    const privateRaw = raw as unknown as {
-      getFrontSafeModel(
-        baseModel: Matrix4,
-        depthFrame: DepthFrame,
-        effective: {
-          zScale: number;
-          zBias: number;
-          zGamma: number;
-          planeScale: number;
-        },
-        zMaxClip: number,
-        fixedSourceProjectionActive: boolean,
-        activeTargetDiameter: number
-      ): Matrix4;
-    };
+    const privateRaw = raw as unknown as FrontSafeModelTestApi;
 
     const model = privateRaw.getFrontSafeModel(
       new Matrix4().makeTranslation(0, 0, entryPivot),
@@ -271,7 +419,8 @@ describe('Looking Glass immediate foreground recovery', () => {
       { zScale: 1, zBias: 0, zGamma: 1, planeScale: 2 },
       50,
       true,
-      captureDiameter / projectionScale
+      captureDiameter / projectionScale,
+      { minU: 0.2, maxU: 1, minV: 0, maxV: 1 }
     );
     const scale = raw.getLookingGlassSourceDepthScale();
     const nearDistance =
@@ -352,6 +501,57 @@ describe('scaleXRProjectionForSourceFit', () => {
   });
 });
 
+describe('Looking Glass visible depth region', () => {
+  const calibration = {
+    focalNormX: 0.5,
+    focalNormY: 0.5,
+    principalUvX: 0.5,
+    principalUvY: 0.5,
+    depthMetricScale: 1,
+    displayAspect: 1,
+  };
+  const baseProjection = new Matrix4().makePerspective(
+    -1,
+    1,
+    1,
+    -1,
+    1,
+    10
+  );
+
+  it('inverts projection zoom into the corresponding source crop', () => {
+    const projection = scaleXRProjectionForSourceFit(
+      baseProjection,
+      2
+    );
+
+    expect(
+      getLookingGlassVisibleDepthSampleRegion(
+        projection,
+        calibration,
+        0
+      )
+    ).toEqual({ minU: 0.25, maxU: 0.75, minV: 0.25, maxV: 0.75 });
+  });
+
+  it('tracks projection pan without changing source geometry', () => {
+    const projection = scaleXRProjectionForSourceFit(
+      baseProjection,
+      2,
+      0.5,
+      0
+    );
+
+    expect(
+      getLookingGlassVisibleDepthSampleRegion(
+        projection,
+        calibration,
+        0
+      )
+    ).toEqual({ minU: 0.125, maxU: 0.625, minV: 0.25, maxV: 0.75 });
+  });
+});
+
 describe('Looking Glass convergence baseline', () => {
   it('clamps distant clicks to both reachable and foreground-safe targets', () => {
     const foregroundSafe = clampLookingGlassConvergenceTarget(
@@ -405,6 +605,73 @@ describe('Looking Glass convergence baseline', () => {
     expect(centerPosition.toArray()).toEqual([0, 0, 4]);
   });
 
+  it('clamps an Auto-enabled click against the visible crop, not off-screen depth', () => {
+    const frame: DepthFrame = {
+      timestampMs: 20_000,
+      width: 200,
+      height: 1,
+      data: new Float32Array([
+        ...new Array(100).fill(0.25),
+        ...new Array(100).fill(1),
+      ]),
+      scale: 1,
+      bias: 0,
+      zMax: 50,
+    };
+    const controls: ViewerControls = {
+      projectionMode: 'pinhole',
+      framingMode: 'source',
+      targetTriangles: 200_000,
+      fovY: 50,
+      sourceFovY: 50,
+      zScale: 1,
+      zBias: 0,
+      zGamma: 1,
+      zMaxClip: 50,
+      planeScale: 2,
+      yOffset: 1.2,
+    };
+    const tanHalfSourceFov = Math.tan((50 * Math.PI) / 360);
+    const sourceAspect = frame.width / frame.height;
+    const baseProjection = new Matrix4().makePerspective(
+      -tanHalfSourceFov * sourceAspect,
+      tanHalfSourceFov * sourceAspect,
+      tanHalfSourceFov,
+      -tanHalfSourceFov,
+      1,
+      100
+    );
+    const raw = Object.create(RawXRTest.prototype) as RawXRTest;
+    Object.assign(raw, {
+      frontSafetyProfile: {
+        mode: 'looking-glass',
+        targetZ: 0,
+        targetDiameter: 1,
+        preserveSourceProjection: true,
+        autoConvergence: true,
+      },
+      latestLookingGlassPickContext: {
+        cameraMatrixWorld: new Matrix4().makeTranslation(0, 0, 1),
+        projectionMatrix: scaleXRProjectionForSourceFit(
+          baseProjection,
+          2,
+          -1,
+          0
+        ),
+        modelMatrix: new Matrix4().makeTranslation(0, 0, 1),
+        frame,
+        controls,
+        calibration: null,
+      },
+      lookingGlassSourceDepthScale: 1,
+    });
+
+    const result = raw.getSafeLookingGlassConvergenceTarget(-0.5, true);
+
+    expect(result.targetZ).toBeCloseTo(0, 12);
+    expect(result.foregroundLimited).toBe(true);
+  });
+
   it('rebases an Auto-enabled unreachable click while keeping its apex fixed', () => {
     const sourceOriginZ = 0.314879477;
     const clickedDepth = 1.652332366;
@@ -430,9 +697,18 @@ describe('Looking Glass convergence baseline', () => {
       planeScale: 2,
       yOffset: 1.2,
     };
+    const tanHalfSourceFov = Math.tan((50 * Math.PI) / 360);
+    const sourceAspect = frame.width / frame.height;
     const context = {
       cameraMatrixWorld: new Matrix4().makeTranslation(0, 0, sourceOriginZ),
-      projectionMatrix: new Matrix4(),
+      projectionMatrix: new Matrix4().makePerspective(
+        -tanHalfSourceFov * sourceAspect,
+        tanHalfSourceFov * sourceAspect,
+        tanHalfSourceFov,
+        -tanHalfSourceFov,
+        1,
+        100
+      ),
       modelMatrix: new Matrix4().makeTranslation(0, 0, sourceOriginZ),
       frame,
       controls,
@@ -450,7 +726,7 @@ describe('Looking Glass convergence baseline', () => {
       latestLookingGlassPickContext: context,
       lookingGlassSourceDepthScale: 1,
       autoConvergence: new AutoConvergenceController(),
-      autoConvergencePausedUntilMs: 0,
+      manualFocusLockActive: false,
       autoConvergenceFastUntilMs: 0,
       lastAutoConvergenceFrontBoundaryZ: null,
       lastAutoConvergenceDepthTimestamp: -1,

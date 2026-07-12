@@ -13,7 +13,6 @@ export const LOOKING_GLASS_AUTO_CONVERGENCE_SAMPLE_INTERVAL_MS = 250;
 export const LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_RATE = 10;
 export const LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS = 750;
 export const LOOKING_GLASS_AUTO_CONVERGENCE_NORMAL_RESPONSE_RATE = 2;
-export const LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS = 4_000;
 export const LOOKING_GLASS_SOURCE_DEPTH_SCALE_RANGE = {
   min: 0.01,
   max: 20,
@@ -36,6 +35,13 @@ export interface XRFrontSafetyProfile {
   autoConvergence?: boolean;
   projectionPanX?: number;
   projectionPanY?: number;
+}
+
+export interface NormalizedDepthSampleRegion {
+  minU: number;
+  maxU: number;
+  minV: number;
+  maxV: number;
 }
 
 export function shouldApplyRigidFrontSafety(
@@ -73,7 +79,9 @@ export function estimateRenderedDepthQuantiles(
   controls: EffectiveGeometryControls,
   zMaxClip: number,
   quantiles: readonly number[],
-  maxSamples = 2048
+  maxSamples = 2048,
+  sampleRegion: NormalizedDepthSampleRegion | null = null,
+  minValidSamples = 1
 ): number[] | null {
   const width = Math.max(0, Math.floor(frame.width));
   const height = Math.max(0, Math.floor(frame.height));
@@ -86,21 +94,39 @@ export function estimateRenderedDepthQuantiles(
     return null;
   }
 
+  const clampUnit = (value: number, fallback: number): number =>
+    Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : fallback;
+  const minU = sampleRegion ? clampUnit(sampleRegion.minU, 0) : 0;
+  const maxU = sampleRegion ? clampUnit(sampleRegion.maxU, 1) : 1;
+  const minV = sampleRegion ? clampUnit(sampleRegion.minV, 0) : 0;
+  const maxV = sampleRegion ? clampUnit(sampleRegion.maxV, 1) : 1;
+  if (maxU <= minU || maxV <= minV) return null;
+
+  const lastX = width - 1;
+  const lastY = height - 1;
+  const minX = Math.min(lastX, Math.max(0, Math.ceil(minU * lastX)));
+  const maxX = Math.min(lastX, Math.max(0, Math.floor(maxU * lastX)));
+  const minY = Math.min(lastY, Math.max(0, Math.ceil(minV * lastY)));
+  const maxY = Math.min(lastY, Math.max(0, Math.floor(maxV * lastY)));
+  if (maxX < minX || maxY < minY) return null;
+
+  const regionWidth = maxX - minX + 1;
+  const regionHeight = maxY - minY + 1;
   const sampleBudget = Math.max(1, Math.floor(maxSamples));
   const stride = Math.max(
     1,
-    Math.ceil(Math.sqrt((width * height) / sampleBudget))
+    Math.ceil(Math.sqrt((regionWidth * regionHeight) / sampleBudget))
   );
   const clip = Number.isFinite(zMaxClip) && zMaxClip > 0
     ? zMaxClip
     : Number.POSITIVE_INFINITY;
   const values: number[] = [];
 
-  const xStart = Math.min(Math.floor(stride / 2), width - 1);
-  const yStart = Math.min(Math.floor(stride / 2), height - 1);
-  for (let y = yStart; y < height; y += stride) {
+  const xStart = minX + Math.min(Math.floor(stride / 2), regionWidth - 1);
+  const yStart = minY + Math.min(Math.floor(stride / 2), regionHeight - 1);
+  for (let y = yStart; y <= maxY; y += stride) {
     const row = y * width;
-    for (let x = xStart; x < width; x += stride) {
+    for (let x = xStart; x <= maxX; x += stride) {
       const raw = frame.data[row + x];
       if (!Number.isFinite(raw) || raw <= 0) continue;
       const shaped = Math.pow(raw, controls.zGamma);
@@ -113,7 +139,8 @@ export function estimateRenderedDepthQuantiles(
     }
   }
 
-  if (values.length === 0) return null;
+  const requiredSamples = Math.max(1, Math.floor(minValidSamples));
+  if (values.length < requiredSamples) return null;
   values.sort((a, b) => a - b);
   return quantiles.map((quantile) => {
     const bounded = Number.isFinite(quantile)
@@ -366,6 +393,29 @@ interface LookingGlassAutoConvergenceClassificationInput {
   targetDiameter: number;
 }
 
+/** Detect a real depth-boundary jump independently from the current target. */
+export function isLookingGlassAutoConvergenceSceneChange(
+  frontBoundaryZ: number,
+  previousFrontBoundaryZ: number | null,
+  targetDiameter: number
+): boolean {
+  if (
+    !Number.isFinite(frontBoundaryZ) ||
+    previousFrontBoundaryZ === null ||
+    !Number.isFinite(previousFrontBoundaryZ)
+  ) {
+    return false;
+  }
+  const diameter = Number.isFinite(targetDiameter)
+    ? Math.max(Math.abs(targetDiameter), 0.1)
+    : 1;
+  const sceneChangeThreshold = Math.max(0.25, diameter * 0.15);
+  return (
+    Math.abs(frontBoundaryZ - previousFrontBoundaryZ) >
+    sceneChangeThreshold
+  );
+}
+
 /**
  * Decide whether a Looking Glass convergence update may skip manual hold and
  * temporal confirmation. World +Z is toward the viewer in this render path.
@@ -390,7 +440,6 @@ export function classifyLookingGlassAutoConvergence({
     ? Math.max(Math.abs(targetDiameter), 0.1)
     : 1;
   const placementDeadband = Math.max(0.02, diameter * 0.01);
-  const sceneChangeThreshold = Math.max(0.25, diameter * 0.15);
 
   // Placement safety takes priority over the generic scene-change label. A
   // close cut commonly satisfies both, but it must use the non-animated
@@ -401,12 +450,11 @@ export function classifyLookingGlassAutoConvergence({
   if (frontBoundaryZ < currentTargetZ - placementDeadband) {
     return 'all-behind';
   }
-  if (
-    previousFrontBoundaryZ !== null &&
-    Number.isFinite(previousFrontBoundaryZ) &&
-    Math.abs(frontBoundaryZ - previousFrontBoundaryZ) >
-      sceneChangeThreshold
-  ) {
+  if (isLookingGlassAutoConvergenceSceneChange(
+    frontBoundaryZ,
+    previousFrontBoundaryZ,
+    targetDiameter
+  )) {
     return 'scene-change';
   }
   return 'normal';
