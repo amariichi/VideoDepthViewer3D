@@ -13,7 +13,6 @@ export const LOOKING_GLASS_AUTO_CONVERGENCE_SAMPLE_INTERVAL_MS = 250;
 export const LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_RATE = 10;
 export const LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS = 750;
 export const LOOKING_GLASS_AUTO_CONVERGENCE_NORMAL_RESPONSE_RATE = 2;
-export const LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS = 4_000;
 export const LOOKING_GLASS_SOURCE_DEPTH_SCALE_RANGE = {
   min: 0.01,
   max: 20,
@@ -366,6 +365,29 @@ interface LookingGlassAutoConvergenceClassificationInput {
   targetDiameter: number;
 }
 
+/** Detect a real depth-boundary jump independently from the current target. */
+export function isLookingGlassAutoConvergenceSceneChange(
+  frontBoundaryZ: number,
+  previousFrontBoundaryZ: number | null,
+  targetDiameter: number
+): boolean {
+  if (
+    !Number.isFinite(frontBoundaryZ) ||
+    previousFrontBoundaryZ === null ||
+    !Number.isFinite(previousFrontBoundaryZ)
+  ) {
+    return false;
+  }
+  const diameter = Number.isFinite(targetDiameter)
+    ? Math.max(Math.abs(targetDiameter), 0.1)
+    : 1;
+  const sceneChangeThreshold = Math.max(0.25, diameter * 0.15);
+  return (
+    Math.abs(frontBoundaryZ - previousFrontBoundaryZ) >
+    sceneChangeThreshold
+  );
+}
+
 /**
  * Decide whether a Looking Glass convergence update may skip manual hold and
  * temporal confirmation. World +Z is toward the viewer in this render path.
@@ -390,7 +412,6 @@ export function classifyLookingGlassAutoConvergence({
     ? Math.max(Math.abs(targetDiameter), 0.1)
     : 1;
   const placementDeadband = Math.max(0.02, diameter * 0.01);
-  const sceneChangeThreshold = Math.max(0.25, diameter * 0.15);
 
   // Placement safety takes priority over the generic scene-change label. A
   // close cut commonly satisfies both, but it must use the non-animated
@@ -401,12 +422,11 @@ export function classifyLookingGlassAutoConvergence({
   if (frontBoundaryZ < currentTargetZ - placementDeadband) {
     return 'all-behind';
   }
-  if (
-    previousFrontBoundaryZ !== null &&
-    Number.isFinite(previousFrontBoundaryZ) &&
-    Math.abs(frontBoundaryZ - previousFrontBoundaryZ) >
-      sceneChangeThreshold
-  ) {
+  if (isLookingGlassAutoConvergenceSceneChange(
+    frontBoundaryZ,
+    previousFrontBoundaryZ,
+    targetDiameter
+  )) {
     return 'scene-change';
   }
   return 'normal';

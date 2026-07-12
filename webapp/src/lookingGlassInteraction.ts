@@ -19,6 +19,13 @@ const WHEEL_LINE_HEIGHT_PX = 16;
 const DEFAULT_WHEEL_PAGE_HEIGHT_PX = 800;
 const PICK_DISCONTINUITY_ABSOLUTE = 0.15;
 const PICK_DISCONTINUITY_RELATIVE = 0.2;
+const FAR_FOCUS_CONFIRMATION_MIN_JUMP = 0.25;
+const FAR_FOCUS_CONFIRMATION_DIAMETER_FRACTION = 0.35;
+const FAR_FOCUS_CONFIRMATION_MIN_DELAY_MS = 600;
+const FAR_FOCUS_CONFIRMATION_MAX_DELAY_MS = 2_500;
+const FAR_FOCUS_CONFIRMATION_MAX_SCREEN_DISTANCE = 0.08;
+const FAR_FOCUS_CONFIRMATION_MIN_DEPTH_TOLERANCE = 0.15;
+const FAR_FOCUS_CONFIRMATION_DEPTH_TOLERANCE_FRACTION = 0.15;
 
 export interface LookingGlassDepthPickInput {
   normalizedX: number;
@@ -34,6 +41,103 @@ export interface LookingGlassDepthPickInput {
 export interface LookingGlassDepthPick {
   point: THREE.Vector3;
   distance: number;
+}
+
+export interface LookingGlassFocusClick {
+  normalizedX: number;
+  normalizedY: number;
+  requestedTargetZ: number;
+  currentTargetZ: number;
+  targetDiameter: number;
+  nowMs?: number;
+}
+
+export interface LookingGlassFocusClickDecision {
+  action: 'accept' | 'confirm-far-focus';
+  confirmedFarFocus: boolean;
+}
+
+interface PendingFarFocusClick {
+  normalizedX: number;
+  normalizedY: number;
+  requestedTargetZ: number;
+  startedAtMs: number;
+}
+
+/**
+ * Prevent one accidental background click from becoming a persistent focus
+ * lock. A deliberately large move remains available by clicking the same area
+ * again after the normal OS double-click interval.
+ */
+export class LookingGlassFocusClickGuard {
+  private pending: PendingFarFocusClick | null = null;
+
+  reset(): void {
+    this.pending = null;
+  }
+
+  evaluate(input: LookingGlassFocusClick): LookingGlassFocusClickDecision {
+    const now = Number.isFinite(input.nowMs)
+      ? input.nowMs as number
+      : performance.now();
+    const targetDiameter =
+      Number.isFinite(input.targetDiameter) && input.targetDiameter > 0
+        ? input.targetDiameter
+        : 1;
+    const farJumpThreshold = Math.max(
+      FAR_FOCUS_CONFIRMATION_MIN_JUMP,
+      targetDiameter * FAR_FOCUS_CONFIRMATION_DIAMETER_FRACTION
+    );
+    const isFarJump =
+      Number.isFinite(input.currentTargetZ) &&
+      Number.isFinite(input.requestedTargetZ) &&
+      input.requestedTargetZ < input.currentTargetZ - farJumpThreshold;
+
+    if (!isFarJump) {
+      this.pending = null;
+      return { action: 'accept', confirmedFarFocus: false };
+    }
+
+    const pending = this.pending;
+    if (pending) {
+      const ageMs = now - pending.startedAtMs;
+      const screenDistance = Math.hypot(
+        input.normalizedX - pending.normalizedX,
+        input.normalizedY - pending.normalizedY
+      );
+      const depthTolerance = Math.max(
+        FAR_FOCUS_CONFIRMATION_MIN_DEPTH_TOLERANCE,
+        targetDiameter * FAR_FOCUS_CONFIRMATION_DEPTH_TOLERANCE_FRACTION
+      );
+      const sameArea =
+        screenDistance <= FAR_FOCUS_CONFIRMATION_MAX_SCREEN_DISTANCE &&
+        Math.abs(input.requestedTargetZ - pending.requestedTargetZ) <=
+          depthTolerance;
+
+      if (
+        sameArea &&
+        ageMs >= FAR_FOCUS_CONFIRMATION_MIN_DELAY_MS &&
+        ageMs <= FAR_FOCUS_CONFIRMATION_MAX_DELAY_MS
+      ) {
+        this.pending = null;
+        return { action: 'accept', confirmedFarFocus: true };
+      }
+
+      // Do not turn the second half of a fullscreen double-click into a
+      // confirmation. Preserve the first click until the minimum delay passes.
+      if (sameArea && ageMs >= 0 && ageMs < FAR_FOCUS_CONFIRMATION_MIN_DELAY_MS) {
+        return { action: 'confirm-far-focus', confirmedFarFocus: false };
+      }
+    }
+
+    this.pending = {
+      normalizedX: input.normalizedX,
+      normalizedY: input.normalizedY,
+      requestedTargetZ: input.requestedTargetZ,
+      startedAtMs: now,
+    };
+    return { action: 'confirm-far-focus', confirmedFarFocus: false };
+  }
 }
 
 /** RawXR grid v=0 is the top row; typed depth uploads retain row order. */

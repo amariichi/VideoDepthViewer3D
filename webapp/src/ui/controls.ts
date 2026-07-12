@@ -13,12 +13,14 @@ interface ControlCallbacks {
   getSyncDeltaMs: () => number;
   getFrontSafetyPushback: () => number;
   getLookingGlassEffectiveTargetZ: () => number;
+  getLookingGlassManualFocusLocked: () => boolean;
   getLookingGlassSourceDepthScale: () => number;
   getViewDistance: () => number;
   onViewDistanceChanged: (distance: number) => void;
   getModelZOffset: () => number;
   onModelZOffsetChanged: (offset: number) => void;
   onLookingGlassViewChanged: (controls: LookingGlassViewControls) => void;
+  onLookingGlassResumeAuto: () => void;
   onLookingGlassRefitForeground: () => void;
   onLookingGlassResetView: () => void;
 }
@@ -40,6 +42,7 @@ export class ControlPanel {
   private modelZState = { modelZOffset: 0 };
   private lookingGlassViewState: LookingGlassViewControls & {
     targetZ: number;
+    resumeAuto: () => void;
     refitForeground: () => void;
     resetView: () => void;
   } = {
@@ -50,6 +53,7 @@ export class ControlPanel {
     focusBaseZ: 0,
     focusTrimZ: 0,
     targetZ: 0,
+    resumeAuto: () => this.callbacks.onLookingGlassResumeAuto(),
     refitForeground: () => this.callbacks.onLookingGlassRefitForeground(),
     resetView: () => this.callbacks.onLookingGlassResetView(),
   };
@@ -58,6 +62,7 @@ export class ControlPanel {
   private modelZController: ReturnType<GUI['add']> | null = null;
   private lookingGlassZoomController: ReturnType<GUI['add']> | null = null;
   private lookingGlassAutoConvergenceController: ReturnType<GUI['add']> | null = null;
+  private lookingGlassResumeAutoController: ReturnType<GUI['add']> | null = null;
   private lookingGlassFocusTrimController: ReturnType<GUI['add']> | null = null;
   private lookingGlassTargetController: ReturnType<GUI['add']> | null = null;
 
@@ -179,9 +184,18 @@ export class ControlPanel {
     this.lookingGlassAutoConvergenceController = lookingGlassFolder
       .add(this.lookingGlassViewState, 'autoConvergence')
       .name('Auto Depth Placement')
-      .onChange(applyLookingGlassView);
+      .onChange(() => {
+        applyLookingGlassView();
+        this.updateLookingGlassAutoControlsAvailability();
+      });
     this.lookingGlassAutoConvergenceController.domElement.title =
-      'Looking Glass Source View only: keeps the front 20% depth boundary near zero parallax. Crowded foreground snaps on the next depth frame. Disable for indefinite manual focus; hard q1 near-plane clipping protection remains active.';
+      'Looking Glass Source View only: keeps the front 20% depth boundary near zero parallax. A depth click locks focus until Resume Auto, a scene cut, or a safety correction. Hard near-plane protection remains active.';
+    this.lookingGlassResumeAutoController = lookingGlassFolder
+      .add(this.lookingGlassViewState, 'resumeAuto')
+      .name('Resume Auto');
+    this.lookingGlassResumeAutoController.domElement.title =
+      'Release a click-selected focus lock and resume automatic depth placement. Scene cuts and unsafe foreground placement release it automatically.';
+    this.updateLookingGlassAutoControlsAvailability();
     this.lookingGlassFocusTrimController = lookingGlassFolder
       .add(
         this.lookingGlassViewState,
@@ -357,6 +371,7 @@ export class ControlPanel {
           this.lookingGlassTargetController?.updateDisplay();
         }
       }
+      this.updateLookingGlassAutoControlsAvailability();
     }, 500);
 
     perfFolder.close();
@@ -388,6 +403,7 @@ export class ControlPanel {
     this.lookingGlassAutoConvergenceController?.updateDisplay();
     this.lookingGlassFocusTrimController?.updateDisplay();
     this.lookingGlassTargetController?.updateDisplay();
+    this.updateLookingGlassAutoControlsAvailability();
   }
 
   setFramingMode(mode: ViewFramingMode): void {
@@ -400,5 +416,12 @@ export class ControlPanel {
     const sourceViewOwnsPlacement = this.framingState.framingMode === 'source';
     this.cameraDistanceController?.disable(sourceViewOwnsPlacement);
     this.modelZController?.disable(sourceViewOwnsPlacement);
+  }
+
+  private updateLookingGlassAutoControlsAvailability(): void {
+    const canResume =
+      this.lookingGlassViewState.autoConvergence &&
+      this.callbacks.getLookingGlassManualFocusLocked();
+    this.lookingGlassResumeAutoController?.disable(!canResume);
   }
 }

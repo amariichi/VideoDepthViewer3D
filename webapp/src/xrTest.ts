@@ -23,7 +23,6 @@ import {
   LOOKING_GLASS_AUTO_CONVERGENCE_FRONT_QUANTILE,
   LOOKING_GLASS_AUTO_CONVERGENCE_NORMAL_RESPONSE_RATE,
   LOOKING_GLASS_AUTO_CONVERGENCE_SAMPLE_INTERVAL_MS,
-  LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS,
   AutoConvergenceController,
   FrontSafetyController,
   LOOKING_GLASS_LATER_INCREASE_CONFIRMATION_SAMPLES,
@@ -35,6 +34,7 @@ import {
   getLookingGlassSourceDepthScaleRebase,
   getLookingGlassSourceNearClipRebase,
   getWebXRRequiredPushback,
+  isLookingGlassAutoConvergenceSceneChange,
   type XRFrontSafetyProfile,
 } from './render/frontSafety';
 import { DEFAULT_LOOKING_GLASS_FOV_Y } from './lookingGlass';
@@ -396,7 +396,7 @@ export class RawXRTest {
   private frontSafetyProfile: XRFrontSafetyProfile = { mode: 'webxr' };
   private readonly frontSafety = new FrontSafetyController();
   private readonly autoConvergence = new AutoConvergenceController();
-  private autoConvergencePausedUntilMs = 0;
+  private manualFocusLockActive = false;
   private autoConvergenceFastUntilMs = 0;
   private lastAutoConvergenceFrontBoundaryZ: number | null = null;
   private lastAutoConvergenceDepthTimestamp = -1;
@@ -474,7 +474,7 @@ export class RawXRTest {
     this.lastUploadedVideoFrame = -1;
     this.frontSafety.reset();
     this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
-    this.autoConvergencePausedUntilMs = 0;
+    this.manualFocusLockActive = false;
     this.autoConvergenceFastUntilMs = 0;
     this.lastAutoConvergenceFrontBoundaryZ = null;
     this.lastAutoConvergenceDepthTimestamp = -1;
@@ -497,7 +497,7 @@ export class RawXRTest {
       this.autoConvergence.reset(profile.targetZ);
       this.autoConvergenceFastUntilMs = 0;
       if (autoContextChanged) {
-        this.autoConvergencePausedUntilMs = 0;
+        this.manualFocusLockActive = false;
         this.lastAutoConvergenceFrontBoundaryZ = null;
         this.lastAutoConvergenceDepthTimestamp = -1;
         this.lastLookingGlassSourceDepthRebaseTimestamp = -1;
@@ -511,7 +511,7 @@ export class RawXRTest {
   refitFrontSafety(): void {
     this.frontSafety.reset();
     this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
-    this.autoConvergencePausedUntilMs = 0;
+    this.manualFocusLockActive = false;
     this.autoConvergenceFastUntilMs = 0;
     this.lastAutoConvergenceFrontBoundaryZ = null;
     this.lastAutoConvergenceDepthTimestamp = -1;
@@ -651,7 +651,7 @@ export class RawXRTest {
       rebase.scaleFactor
     );
     this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
-    this.autoConvergencePausedUntilMs = 0;
+    this.manualFocusLockActive = false;
     this.autoConvergenceFastUntilMs = 0;
     this.lastAutoConvergenceFrontBoundaryZ = null;
     this.lastAutoConvergenceDepthTimestamp = -1;
@@ -678,22 +678,32 @@ export class RawXRTest {
 
   setManualLookingGlassConvergenceTarget(
     requestedTargetZ: number,
-    durationMs = LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS
+    lockAutoPlacement = true
   ): LookingGlassConvergenceTargetClamp {
     const clamped = this.getSafeLookingGlassConvergenceTarget(
       requestedTargetZ
     );
-    const duration = Number.isFinite(durationMs)
-      ? Math.max(durationMs, 0)
-      : LOOKING_GLASS_MANUAL_FOCUS_HOLD_MS;
-    this.autoConvergencePausedUntilMs =
-      this.frontSafetyProfile.autoConvergence === true && duration > 0
-        ? performance.now() + duration
-        : 0;
+    this.manualFocusLockActive =
+      this.frontSafetyProfile.autoConvergence === true && lockAutoPlacement;
     this.autoConvergence.reset(clamped.targetZ);
     this.lastFrontSafetySampleMs = 0;
     this.autoConvergenceFastUntilMs = 0;
     return clamped;
+  }
+
+  isLookingGlassManualFocusLocked(): boolean {
+    return this.manualFocusLockActive;
+  }
+
+  resumeLookingGlassAutoConvergence(): boolean {
+    const wasLocked = this.manualFocusLockActive;
+    this.manualFocusLockActive = false;
+    this.lastAutoConvergenceDepthTimestamp = -1;
+    this.lastAutoConvergenceFrontBoundaryZ = null;
+    this.lastFrontSafetySampleMs = 0;
+    this.autoConvergenceFastUntilMs =
+      performance.now() + LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS;
+    return wasLocked;
   }
 
   enableDepthMesh(): void {
@@ -731,7 +741,7 @@ export class RawXRTest {
     this.latestLookingGlassPickContext = null;
     this.frontSafety.reset();
     this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
-    this.autoConvergencePausedUntilMs = 0;
+    this.manualFocusLockActive = false;
     this.autoConvergenceFastUntilMs = 0;
     this.lastAutoConvergenceFrontBoundaryZ = null;
     this.lastAutoConvergenceDepthTimestamp = -1;
@@ -1060,7 +1070,7 @@ export class RawXRTest {
     this.latestLookingGlassPickContext = null;
     this.frontSafety.reset();
     this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
-    this.autoConvergencePausedUntilMs = 0;
+    this.manualFocusLockActive = false;
     this.autoConvergenceFastUntilMs = 0;
     this.lastAutoConvergenceFrontBoundaryZ = null;
     this.lastAutoConvergenceDepthTimestamp = -1;
@@ -1424,7 +1434,7 @@ export class RawXRTest {
             this.autoConvergence.reset(
               this.frontSafetyProfile.targetZ
             );
-            this.autoConvergencePausedUntilMs = 0;
+            this.manualFocusLockActive = false;
             this.autoConvergenceFastUntilMs =
               now + LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS;
             this.lastAutoConvergenceFrontBoundaryZ = null;
@@ -1465,7 +1475,7 @@ export class RawXRTest {
             this.autoConvergence.reset(
               this.frontSafetyProfile.targetZ
             );
-            this.autoConvergencePausedUntilMs = 0;
+            this.manualFocusLockActive = false;
             this.autoConvergenceFastUntilMs =
               now + LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS;
             this.lastAutoConvergenceFrontBoundaryZ = null;
@@ -1522,7 +1532,7 @@ export class RawXRTest {
             crowdedBoundaryZ
           );
           if (desiredTargetZ !== null) {
-            this.autoConvergencePausedUntilMs = 0;
+            this.manualFocusLockActive = false;
             this.autoConvergenceFastUntilMs = 0;
             this.autoConvergence.snap(desiredTargetZ);
             this.lastAutoConvergenceFrontBoundaryZ = frontBoundaryZ;
@@ -1577,30 +1587,44 @@ export class RawXRTest {
             this.autoConvergence.value ??
             this.frontSafetyProfile.targetZ ??
             0;
+          const previousFrontBoundaryZ =
+            this.lastAutoConvergenceFrontBoundaryZ;
           const urgency = classifyLookingGlassAutoConvergence({
             frontBoundaryZ,
             crowdedBoundaryZ,
             currentTargetZ,
-            previousFrontBoundaryZ:
-              this.lastAutoConvergenceFrontBoundaryZ,
+            previousFrontBoundaryZ,
             targetDiameter,
           });
+          const sceneChanged =
+            isLookingGlassAutoConvergenceSceneChange(
+              frontBoundaryZ,
+              previousFrontBoundaryZ,
+              targetDiameter
+            );
+          const manualFocusLocked = this.manualFocusLockActive;
           this.lastAutoConvergenceFrontBoundaryZ = frontBoundaryZ;
 
           if (
             desiredTargetZ !== null &&
-            (sourceDepthRebased || urgency !== 'normal')
+            (
+              sourceDepthRebased ||
+              urgency === 'crowded-front' ||
+              sceneChanged ||
+              (!manualFocusLocked && urgency === 'all-behind')
+            )
           ) {
-            // Scene cuts and all-behind placement bypass both the four-second
-            // manual hold and three-observation confirmation, then ease over
-            // a short interval. Crowded foreground was already snapped above.
-            this.autoConvergencePausedUntilMs = 0;
+            // A real scene cut and unsafe placement bypass the manual lock.
+            // Merely moving target Z to a clicked foreground point can make
+            // unchanged q10 look all-behind; keep that intentional placement
+            // until the user resumes Auto or a genuine safety signal arrives.
+            this.manualFocusLockActive = false;
             this.autoConvergence.observeImmediate(desiredTargetZ);
             this.autoConvergenceFastUntilMs =
               now + LOOKING_GLASS_AUTO_CONVERGENCE_FAST_RESPONSE_MS;
           } else if (
             desiredTargetZ !== null &&
-            now >= this.autoConvergencePausedUntilMs
+            !manualFocusLocked
           ) {
             // Keep the 20% boundary at zero parallax for a sharper, less
             // distant scene while the 10% boundary still detects all-behind
@@ -1980,7 +2004,7 @@ export class RawXRTest {
     if (this.xrFramingMode === framingMode) return;
     this.xrFramingMode = framingMode;
     this.autoConvergence.reset(this.frontSafetyProfile.targetZ);
-    this.autoConvergencePausedUntilMs = 0;
+    this.manualFocusLockActive = false;
     this.autoConvergenceFastUntilMs = 0;
     this.lastAutoConvergenceFrontBoundaryZ = null;
     this.lastAutoConvergenceDepthTimestamp = -1;

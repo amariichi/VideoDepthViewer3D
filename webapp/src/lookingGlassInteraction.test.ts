@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as THREE from 'three';
 import {
+  LookingGlassFocusClickGuard,
   getLookingGlassWheelZoom,
   isLookingGlassPickTriangleContinuous,
   pickLookingGlassDepthMesh,
@@ -40,6 +41,65 @@ describe('getLookingGlassWheelZoom', () => {
     expect(getLookingGlassWheelZoom(zoomedIn, 100, 0)).toBe(1);
     expect(getLookingGlassWheelZoom(1.02, 100, 0)).toBe(1);
     expect(getLookingGlassWheelZoom(0.98, -100, 0)).toBe(1);
+  });
+});
+
+describe('LookingGlassFocusClickGuard', () => {
+  it('accepts ordinary focus changes without confirmation', () => {
+    const guard = new LookingGlassFocusClickGuard();
+
+    expect(guard.evaluate({
+      normalizedX: 0.5,
+      normalizedY: 0.5,
+      requestedTargetZ: -0.2,
+      currentTargetZ: 0,
+      targetDiameter: 1,
+      nowMs: 1_000,
+    })).toEqual({ action: 'accept', confirmedFarFocus: false });
+  });
+
+  it('requires a delayed second click in the same area for a far focus jump', () => {
+    const guard = new LookingGlassFocusClickGuard();
+    const farClick = {
+      normalizedX: 0.3,
+      normalizedY: 0.4,
+      requestedTargetZ: -2,
+      currentTargetZ: 0,
+      targetDiameter: 1,
+    };
+
+    expect(guard.evaluate({ ...farClick, nowMs: 1_000 }).action)
+      .toBe('confirm-far-focus');
+    expect(guard.evaluate({ ...farClick, nowMs: 1_150 }).action)
+      .toBe('confirm-far-focus');
+    expect(guard.evaluate({
+      ...farClick,
+      normalizedX: 0.32,
+      normalizedY: 0.42,
+      requestedTargetZ: -1.95,
+      nowMs: 1_700,
+    })).toEqual({ action: 'accept', confirmedFarFocus: true });
+  });
+
+  it('does not confirm an expired or spatially unrelated background click', () => {
+    const guard = new LookingGlassFocusClickGuard();
+    const base = {
+      normalizedX: 0.2,
+      normalizedY: 0.2,
+      requestedTargetZ: -2,
+      currentTargetZ: 0,
+      targetDiameter: 1,
+    };
+
+    guard.evaluate({ ...base, nowMs: 1_000 });
+    expect(guard.evaluate({
+      ...base,
+      normalizedX: 0.8,
+      normalizedY: 0.8,
+      nowMs: 1_800,
+    }).action).toBe('confirm-far-focus');
+    expect(guard.evaluate({ ...base, nowMs: 5_000 }).action)
+      .toBe('confirm-far-focus');
   });
 });
 
