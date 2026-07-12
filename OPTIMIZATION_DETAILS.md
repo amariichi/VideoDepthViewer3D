@@ -297,11 +297,17 @@ work to avoid hurting FPS.
 - Looking Glass reuses RawXR and loads its runtime only after explicit entry.
   Wheel zoom and pan modify projection only, avoiding vendor configuration
   updates and quilt reallocation during interaction.
-- Looking Glass Source View uses one sparse 2,048-point depth traversal per new
-  applied frame for q1/q10/q20 safety statistics. q20 foreground overflow may
-  update convergence immediately; q1 protects the actual near plane. When a
-  scene lies outside the supported convergence range, an apex-centered uniform
-  depth transform preserves source rays and straight borders.
+- Looking Glass Source View spends a fixed 2,048-sample budget inside the source
+  region currently visible after Hologram Zoom and pan, including a small
+  projection guard band. Its q1/q10/q20 statistics drive normal convergence,
+  reachable-depth rebasing, and foreground recovery; too few valid samples hold
+  the previous target instead of guessing. A cropped view may require a second
+  sparse traversal because full-frame q1 is retained independently for the
+  vendor near-plane guard. Click-selected focus remains locked across ordinary
+  motion until Resume Auto, while scene changes or unsafe foreground can release
+  it. When a scene lies outside the supported convergence range, an
+  apex-centered uniform depth transform preserves source rays and straight
+  borders.
 
 These rules are mode-gated; monitor, SBS, generic WebXR, Looking Glass Source
 View, and creative/free-orbit paths do not silently share incompatible placement
@@ -563,10 +569,14 @@ FPSを損なわないようboundedな処理で実装しています。
 - 接続meshはdepth不連続部を黒い亀裂として切断せず、近傍色を持つ遷移面として描きます。
 - Looking GlassはRawXRを再利用し、明示entry時だけruntimeをloadします。wheel zoomとpanは
   projectionだけを変え、操作中のvendor config更新やquilt再確保を避けます。
-- Looking Glass Source Viewは新しい適用depth frameごとに、2,048点の1回のsparse走査で
-  q1/q10/q20 safety統計を求めます。q20 foreground超過は即時収束可能で、q1は実near
-  planeを保護します。通常収束range外sceneにはsource apex中心のuniform depth変換を
-  行い、source rayと四辺直線を維持します。
+- Looking Glass Source Viewは、Hologram Zoomとpan後に実際に見えているsource領域へ
+  小さなprojection guard bandを加え、その範囲内へ固定2,048 sample予算を割り当てます。
+  viewportのq1/q10/q20統計を通常収束、到達可能depthへのrebase、foreground回復に使い、
+  有効sampleが不足する場合は推測せず直前のtargetを保持します。crop表示時はvendorの
+  near-plane保護用にfull-frame q1を別途維持するため、2回目のsparse走査が発生することが
+  あります。clickで選んだfocusは通常の動きではResume Autoまで固定し、scene切り替えや
+  危険なforegroundでは自動解除できます。通常収束range外sceneにはsource apex中心の
+  uniform depth変換を行い、source rayと四辺直線を維持します。
 
 各規則はmode別に制限され、monitor、SBS、generic WebXR、Looking Glass Source View、
 creative/free-orbitが互換性のない配置処理を暗黙共有しないようにしています。

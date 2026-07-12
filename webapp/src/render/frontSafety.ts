@@ -37,6 +37,13 @@ export interface XRFrontSafetyProfile {
   projectionPanY?: number;
 }
 
+export interface NormalizedDepthSampleRegion {
+  minU: number;
+  maxU: number;
+  minV: number;
+  maxV: number;
+}
+
 export function shouldApplyRigidFrontSafety(
   profile: XRFrontSafetyProfile
 ): boolean {
@@ -72,7 +79,9 @@ export function estimateRenderedDepthQuantiles(
   controls: EffectiveGeometryControls,
   zMaxClip: number,
   quantiles: readonly number[],
-  maxSamples = 2048
+  maxSamples = 2048,
+  sampleRegion: NormalizedDepthSampleRegion | null = null,
+  minValidSamples = 1
 ): number[] | null {
   const width = Math.max(0, Math.floor(frame.width));
   const height = Math.max(0, Math.floor(frame.height));
@@ -85,21 +94,39 @@ export function estimateRenderedDepthQuantiles(
     return null;
   }
 
+  const clampUnit = (value: number, fallback: number): number =>
+    Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : fallback;
+  const minU = sampleRegion ? clampUnit(sampleRegion.minU, 0) : 0;
+  const maxU = sampleRegion ? clampUnit(sampleRegion.maxU, 1) : 1;
+  const minV = sampleRegion ? clampUnit(sampleRegion.minV, 0) : 0;
+  const maxV = sampleRegion ? clampUnit(sampleRegion.maxV, 1) : 1;
+  if (maxU <= minU || maxV <= minV) return null;
+
+  const lastX = width - 1;
+  const lastY = height - 1;
+  const minX = Math.min(lastX, Math.max(0, Math.ceil(minU * lastX)));
+  const maxX = Math.min(lastX, Math.max(0, Math.floor(maxU * lastX)));
+  const minY = Math.min(lastY, Math.max(0, Math.ceil(minV * lastY)));
+  const maxY = Math.min(lastY, Math.max(0, Math.floor(maxV * lastY)));
+  if (maxX < minX || maxY < minY) return null;
+
+  const regionWidth = maxX - minX + 1;
+  const regionHeight = maxY - minY + 1;
   const sampleBudget = Math.max(1, Math.floor(maxSamples));
   const stride = Math.max(
     1,
-    Math.ceil(Math.sqrt((width * height) / sampleBudget))
+    Math.ceil(Math.sqrt((regionWidth * regionHeight) / sampleBudget))
   );
   const clip = Number.isFinite(zMaxClip) && zMaxClip > 0
     ? zMaxClip
     : Number.POSITIVE_INFINITY;
   const values: number[] = [];
 
-  const xStart = Math.min(Math.floor(stride / 2), width - 1);
-  const yStart = Math.min(Math.floor(stride / 2), height - 1);
-  for (let y = yStart; y < height; y += stride) {
+  const xStart = minX + Math.min(Math.floor(stride / 2), regionWidth - 1);
+  const yStart = minY + Math.min(Math.floor(stride / 2), regionHeight - 1);
+  for (let y = yStart; y <= maxY; y += stride) {
     const row = y * width;
-    for (let x = xStart; x < width; x += stride) {
+    for (let x = xStart; x <= maxX; x += stride) {
       const raw = frame.data[row + x];
       if (!Number.isFinite(raw) || raw <= 0) continue;
       const shaped = Math.pow(raw, controls.zGamma);
@@ -112,7 +139,8 @@ export function estimateRenderedDepthQuantiles(
     }
   }
 
-  if (values.length === 0) return null;
+  const requiredSamples = Math.max(1, Math.floor(minValidSamples));
+  if (values.length < requiredSamples) return null;
   values.sort((a, b) => a - b);
   return quantiles.map((quantile) => {
     const bounded = Number.isFinite(quantile)

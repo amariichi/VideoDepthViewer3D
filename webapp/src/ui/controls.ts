@@ -189,7 +189,7 @@ export class ControlPanel {
         this.updateLookingGlassAutoControlsAvailability();
       });
     this.lookingGlassAutoConvergenceController.domElement.title =
-      'Looking Glass Source View only: keeps the front 20% depth boundary near zero parallax. A depth click locks focus until Resume Auto, a scene cut, or a safety correction. Hard near-plane protection remains active.';
+      'Looking Glass Source View only: keeps the front 20% of the currently visible zoom/pan region near zero parallax. A depth click locks focus until Resume Auto, a scene cut, or a safety correction. Hard full-frame near-plane protection remains active.';
     this.lookingGlassResumeAutoController = lookingGlassFolder
       .add(this.lookingGlassViewState, 'resumeAuto')
       .name('Resume Auto');

@@ -12,6 +12,7 @@ import {
   getEffectiveGeometryControls,
   getProjectionCalibration,
   getProjectionMix,
+  type ProjectionCalibration,
 } from './render/projection';
 import { getGridSegments } from './render/mesh';
 import {
@@ -35,6 +36,7 @@ import {
   getLookingGlassSourceNearClipRebase,
   getWebXRRequiredPushback,
   isLookingGlassAutoConvergenceSceneChange,
+  type NormalizedDepthSampleRegion,
   type XRFrontSafetyProfile,
 } from './render/frontSafety';
 import { DEFAULT_LOOKING_GLASS_FOV_Y } from './lookingGlass';
@@ -155,6 +157,81 @@ export function scaleXRProjectionForSourceFit(
     .makeTranslation(safePanX, safePanY, 0)
     .multiply(scaleMatrix)
     .multiply(projection);
+}
+
+export const LOOKING_GLASS_VISIBLE_DEPTH_GUARD_NDC = 0.1;
+const LOOKING_GLASS_VISIBLE_DEPTH_MIN_SAMPLES = 64;
+
+/**
+ * In fixed pinhole Source View, source UV maps affinely to the mean view's
+ * NDC regardless of metric depth. Invert that mapping once so automatic depth
+ * placement samples the source region which zoom and pan actually display.
+ */
+export function getLookingGlassVisibleDepthSampleRegion(
+  projectionMatrix: THREE.Matrix4,
+  calibration: ProjectionCalibration,
+  guardNdc = LOOKING_GLASS_VISIBLE_DEPTH_GUARD_NDC
+): NormalizedDepthSampleRegion | null {
+  const elements = projectionMatrix.elements;
+  const scaleX = elements[0];
+  const scaleY = elements[5];
+  const offsetX = elements[8];
+  const offsetY = elements[9];
+  if (
+    ![
+      scaleX,
+      scaleY,
+      offsetX,
+      offsetY,
+      calibration.focalNormX,
+      calibration.focalNormY,
+      calibration.principalUvX,
+      calibration.principalUvY,
+    ].every(Number.isFinite) ||
+    Math.abs(scaleX) < 1e-6 ||
+    Math.abs(scaleY) < 1e-6 ||
+    calibration.focalNormX <= 0 ||
+    calibration.focalNormY <= 0
+  ) {
+    return null;
+  }
+
+  const guard = Number.isFinite(guardNdc)
+    ? Math.min(Math.max(guardNdc, 0), 1)
+    : LOOKING_GLASS_VISIBLE_DEPTH_GUARD_NDC;
+  const ndcMin = -1 - guard;
+  const ndcMax = 1 + guard;
+  const uForNdc = (ndcX: number): number =>
+    calibration.principalUvX +
+    (calibration.focalNormX * (ndcX + offsetX)) / scaleX;
+  const vForNdc = (ndcY: number): number =>
+    1 -
+    calibration.principalUvY -
+    (calibration.focalNormY * (ndcY + offsetY)) / scaleY;
+  const rawMinU = Math.min(uForNdc(ndcMin), uForNdc(ndcMax));
+  const rawMaxU = Math.max(uForNdc(ndcMin), uForNdc(ndcMax));
+  const rawMinV = Math.min(vForNdc(ndcMin), vForNdc(ndcMax));
+  const rawMaxV = Math.max(vForNdc(ndcMin), vForNdc(ndcMax));
+  const minU = Math.max(0, rawMinU);
+  const maxU = Math.min(1, rawMaxU);
+  const minV = Math.max(0, rawMinV);
+  const maxV = Math.min(1, rawMaxV);
+  if (maxU <= minU || maxV <= minV) {
+    return { minU: 0, maxU: 0, minV: 0, maxV: 0 };
+  }
+  return { minU, maxU, minV, maxV };
+}
+
+function isFullDepthSampleRegion(
+  region: NormalizedDepthSampleRegion | null
+): boolean {
+  return (
+    region === null ||
+    (region.minU <= 1e-6 &&
+      region.maxU >= 1 - 1e-6 &&
+      region.minV <= 1e-6 &&
+      region.maxV >= 1 - 1e-6)
+  );
 }
 
 export const LOOKING_GLASS_CONVERGENCE_BASELINE_SCALE_RANGE = {
@@ -492,7 +569,13 @@ export class RawXRTest {
       profile.preserveSourceProjection !==
         this.frontSafetyProfile.preserveSourceProjection ||
       profile.autoConvergence !== this.frontSafetyProfile.autoConvergence;
-    if (autoContextChanged || (profile.autoConvergence === true && targetChanged)) {
+    const projectionWindowChanged =
+      profile.projectionScale !== this.frontSafetyProfile.projectionScale ||
+      profile.projectionPanX !== this.frontSafetyProfile.projectionPanX ||
+      profile.projectionPanY !== this.frontSafetyProfile.projectionPanY;
+    const autoTargetChanged =
+      profile.autoConvergence === true && targetChanged;
+    if (autoContextChanged || autoTargetChanged) {
       this.frontSafety.reset();
       this.autoConvergence.reset(profile.targetZ);
       this.autoConvergenceFastUntilMs = 0;
@@ -502,6 +585,21 @@ export class RawXRTest {
         this.lastAutoConvergenceDepthTimestamp = -1;
         this.lastLookingGlassSourceDepthRebaseTimestamp = -1;
       }
+      this.lastFrontSafetySampleMs = 0;
+      this.lastFrontSafetyFrameMs = 0;
+    } else if (
+      profile.autoConvergence === true &&
+      projectionWindowChanged
+    ) {
+      // A zoom/pan gesture changes the observation window, not the selected
+      // focus intent. Clear only automatic history so the old viewport cannot
+      // be mistaken for a scene cut and a click lock remains persistent.
+      this.autoConvergence.reset(
+        this.autoConvergence.value ?? profile.targetZ
+      );
+      this.autoConvergenceFastUntilMs = 0;
+      this.lastAutoConvergenceFrontBoundaryZ = null;
+      this.lastAutoConvergenceDepthTimestamp = -1;
       this.lastFrontSafetySampleMs = 0;
       this.lastFrontSafetyFrameMs = 0;
     }
@@ -559,11 +657,18 @@ export class RawXRTest {
         context.controls,
         projection.depthMetricScale
       );
+      const visibleRegion = getLookingGlassVisibleDepthSampleRegion(
+        context.projectionMatrix,
+        projection
+      );
       const depth = estimateRenderedDepthQuantiles(
         context.frame,
         effective,
         context.controls.zMaxClip,
-        [LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE]
+        [LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE],
+        2048,
+        visibleRegion,
+        LOOKING_GLASS_VISIBLE_DEPTH_MIN_SAMPLES
       )?.[0];
       if (depth !== undefined) {
         crowdedBoundaryZ = new THREE.Vector3(0, 0, -depth)
@@ -612,11 +717,18 @@ export class RawXRTest {
       context.controls,
       projection.depthMetricScale
     );
+    const visibleRegion = getLookingGlassVisibleDepthSampleRegion(
+      context.projectionMatrix,
+      projection
+    );
     const crowdedDepth = estimateRenderedDepthQuantiles(
       context.frame,
       effective,
       context.controls.zMaxClip,
-      [LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE]
+      [LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE],
+      2048,
+      visibleRegion,
+      LOOKING_GLASS_VISIBLE_DEPTH_MIN_SAMPLES
     )?.[0];
     if (crowdedDepth === undefined) return clamped;
 
@@ -1199,14 +1311,6 @@ export class RawXRTest {
             configuredProjectionScale /
             sourceFitProjectionScale
           : this.frontSafetyProfile.targetDiameter ?? 3;
-      const model = this.getFrontSafeModel(
-        this.meshModel,
-        depth,
-        effective,
-        controls.zMaxClip,
-        fixedSourceProjectionActive,
-        activeTargetDiameter
-      );
       const projectionPanX =
         this.frontSafetyProfile.mode === 'looking-glass'
           ? this.frontSafetyProfile.projectionPanX ?? 0
@@ -1221,6 +1325,32 @@ export class RawXRTest {
             centerView.transform.matrix as unknown as number[]
           )
         : null;
+      const centerProjection = centerView
+        ? scaleXRProjectionForSourceFit(
+            new THREE.Matrix4().fromArray(
+              centerView.projectionMatrix as unknown as number[]
+            ),
+            sourceFitProjectionScale,
+            projectionPanX,
+            projectionPanY
+          )
+        : null;
+      const visibleDepthRegion =
+        fixedSourceProjectionActive && centerProjection
+          ? getLookingGlassVisibleDepthSampleRegion(
+              centerProjection,
+              projection
+            )
+          : null;
+      const model = this.getFrontSafeModel(
+        this.meshModel,
+        depth,
+        effective,
+        controls.zMaxClip,
+        fixedSourceProjectionActive,
+        activeTargetDiameter,
+        visibleDepthRegion
+      );
       const useLookingGlassConvergence = fixedSourceProjectionActive;
       const baselineCenterViewMatrix =
         useLookingGlassConvergence && centerViewMatrix
@@ -1254,15 +1384,7 @@ export class RawXRTest {
             effectiveTargetZ
           )
         : 1;
-      if (centerView) {
-        const centerProjection = scaleXRProjectionForSourceFit(
-          new THREE.Matrix4().fromArray(
-            centerView.projectionMatrix as unknown as number[]
-          ),
-          sourceFitProjectionScale,
-          projectionPanX,
-          projectionPanY
-        );
+      if (centerView && centerProjection) {
         this.latestLookingGlassPickContext = {
           cameraMatrixWorld: centerViewMatrix?.clone() ?? new THREE.Matrix4(),
           projectionMatrix: centerProjection,
@@ -1356,7 +1478,8 @@ export class RawXRTest {
     effective: ReturnType<typeof getEffectiveGeometryControls>,
     zMaxClip: number,
     fixedSourceProjectionActive: boolean,
-    activeTargetDiameter: number
+    activeTargetDiameter: number,
+    visibleDepthRegion: NormalizedDepthSampleRegion | null = null
   ): THREE.Matrix4 {
     if (fixedSourceProjectionActive) {
       const now = performance.now();
@@ -1373,7 +1496,7 @@ export class RawXRTest {
         baseModel,
         this.lookingGlassSourceDepthScale
       );
-      let quantileDepths: number[] | null = null;
+      let viewportQuantileDepths: number[] | null = null;
       let sourceDepthRebased = false;
 
       // Normal convergence remains rate-limited, but an entirely unreachable
@@ -1384,20 +1507,42 @@ export class RawXRTest {
         depth.timestampMs !==
           this.lastLookingGlassSourceDepthRebaseTimestamp
       ) {
-        quantileDepths = estimateRenderedDepthQuantiles(
-          depth,
-          effective,
-          zMaxClip,
-          [
-            LOOKING_GLASS_AUTO_REBASE_NEAR_QUANTILE,
-            LOOKING_GLASS_AUTO_CONVERGENCE_FRONT_QUANTILE,
-            LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE,
-          ]
-        );
+        const convergenceQuantiles = [
+          LOOKING_GLASS_AUTO_REBASE_NEAR_QUANTILE,
+          LOOKING_GLASS_AUTO_CONVERGENCE_FRONT_QUANTILE,
+          LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE,
+        ] as const;
+        const fullViewport = isFullDepthSampleRegion(visibleDepthRegion);
+        viewportQuantileDepths = autoConvergenceEnabled
+          ? estimateRenderedDepthQuantiles(
+              depth,
+              effective,
+              zMaxClip,
+              convergenceQuantiles,
+              2048,
+              visibleDepthRegion,
+              visibleDepthRegion && !fullViewport
+                ? LOOKING_GLASS_VISIBLE_DEPTH_MIN_SAMPLES
+                : 1
+            )
+          : null;
+        // Preserve the existing complete-frame q1 only for the vendor's hard
+        // near-plane guard. Normal convergence and reachable-depth rebase use
+        // the source region which is actually visible after zoom and pan.
+        const fullFrameRobustNearDepth =
+          autoConvergenceEnabled && fullViewport
+          ? viewportQuantileDepths?.[0]
+          : estimateRenderedDepthQuantiles(
+              depth,
+              effective,
+              zMaxClip,
+              [LOOKING_GLASS_AUTO_REBASE_NEAR_QUANTILE]
+            )?.[0];
         this.lastLookingGlassSourceDepthRebaseTimestamp = depth.timestampMs;
 
-        if (quantileDepths) {
-          const [robustNearDepth, , crowdedBoundaryDepth] = quantileDepths;
+        if (viewportQuantileDepths) {
+          const [robustNearDepth, , crowdedBoundaryDepth] =
+            viewportQuantileDepths;
           const sourceOriginZ = new THREE.Vector3()
             .setFromMatrixPosition(baseModel).z;
           const robustNearBoundaryZ = new THREE.Vector3(
@@ -1424,7 +1569,10 @@ export class RawXRTest {
               })
             : null;
 
-          if (rebase) {
+          const rebaseOverridesManualFocus =
+            rebase?.reason === 'crowded-front' ||
+            !this.manualFocusLockActive;
+          if (rebase && rebaseOverridesManualFocus) {
             this.lookingGlassSourceDepthScale = rebase.scale;
             sourceModel = scaleModelAboutSourceApex(
               baseModel,
@@ -1449,7 +1597,9 @@ export class RawXRTest {
               });
             }
           }
+        }
 
+        if (fullFrameRobustNearDepth !== undefined) {
           // Lowering WebXR depthNear removes its fixed 0.1 m margin, but the
           // vendor capture-volume bias can still place the actual near plane
           // deep inside a close scene when entry happened on a distant shot.
@@ -1459,7 +1609,7 @@ export class RawXRTest {
             (this.frontSafetyProfile.targetDiameter ?? 3) *
             (this.frontSafetyProfile.projectionScale ?? 1);
           const nearClipRebase = getLookingGlassSourceNearClipRebase({
-            robustNearDepth,
+            robustNearDepth: fullFrameRobustNearDepth,
             currentScale: this.lookingGlassSourceDepthScale,
             targetDiameter: captureTargetDiameter,
             fovYRadians: DEFAULT_LOOKING_GLASS_FOV_Y,
@@ -1501,10 +1651,11 @@ export class RawXRTest {
       if (
         autoConvergenceEnabled &&
         !sourceDepthRebased &&
-        quantileDepths &&
+        viewportQuantileDepths &&
         depth.timestampMs !== this.lastAutoConvergenceDepthTimestamp
       ) {
-        const [, frontBoundaryDepth, crowdedBoundaryDepth] = quantileDepths;
+        const [, frontBoundaryDepth, crowdedBoundaryDepth] =
+          viewportQuantileDepths;
         const frontBoundaryZ = new THREE.Vector3(
           0,
           0,
@@ -1556,7 +1707,7 @@ export class RawXRTest {
           now - this.lastFrontSafetySampleMs >=
             LOOKING_GLASS_AUTO_CONVERGENCE_SAMPLE_INTERVAL_MS)
       ) {
-        quantileDepths ??= estimateRenderedDepthQuantiles(
+        viewportQuantileDepths ??= estimateRenderedDepthQuantiles(
           depth,
           effective,
           zMaxClip,
@@ -1564,10 +1715,16 @@ export class RawXRTest {
             LOOKING_GLASS_AUTO_REBASE_NEAR_QUANTILE,
             LOOKING_GLASS_AUTO_CONVERGENCE_FRONT_QUANTILE,
             LOOKING_GLASS_AUTO_CONVERGENCE_CROWDED_QUANTILE,
-          ]
+          ],
+          2048,
+          visibleDepthRegion,
+          visibleDepthRegion && !isFullDepthSampleRegion(visibleDepthRegion)
+            ? LOOKING_GLASS_VISIBLE_DEPTH_MIN_SAMPLES
+            : 1
         );
-        if (quantileDepths) {
-          const [, frontBoundaryDepth, crowdedBoundaryDepth] = quantileDepths;
+        if (viewportQuantileDepths) {
+          const [, frontBoundaryDepth, crowdedBoundaryDepth] =
+            viewportQuantileDepths;
           const frontBoundaryZ = new THREE.Vector3(
             0,
             0,

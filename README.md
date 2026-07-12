@@ -126,10 +126,15 @@ open on the external display.
 - **Drag with either mouse button:** Pan the image. This does not rotate the
   scene.
 - **Click without dragging:** Use the selected point as the depth focus. Zoom
-  stays unchanged, so zooming remains under your control.
+  stays unchanged, and the selected focus remains locked until you resume
+  automatic placement. An unusually distant selection asks for a second click
+  in the same area to protect against accidental background clicks.
 - **Auto Depth Placement:** Recommended and enabled by default. It follows
-  scene changes, brings distant scenes forward, and moves excessively close
-  content back to keep it visible.
+  the area currently visible after zooming and panning, brings distant scenes
+  forward, and moves excessively close content back to keep it visible. A
+  scene change or an unsafe foreground can release a manual focus lock.
+- **Resume Auto:** Release a click-selected focus lock and immediately return
+  to automatic placement for the currently visible area.
 - **Focus Trim:** Fine-tune depth placement after automatic placement or a
   click.
 - **Reset Zoom / Pan:** Restore the fitted size and centered position.
@@ -425,10 +430,15 @@ macOSでは、Looking Glassを開始するときにブラウザをmacOSのフル
 - **左右どちらかのボタンでドラッグ:** 表示位置を上下左右へ移動します。
   シーンは回転しません。
 - **ドラッグせずにクリック:** 選んだ点を奥行きの基準（ピント位置）にします。
-  ズームは変わらないため、拡大率はホイールで独立して調整できます。
+  ズームは変わらず、**Resume Auto**を選ぶまでピント位置を保持します。極端に遠い
+  点を選んだ場合は、背景への誤クリックを防ぐため、少し間を空けて同じ付近をもう
+  一度クリックすると確定します。
 - **Auto Depth Placement:** デフォルトのまま有効にすることを推奨します。
-  シーン切り替えに追従し、遠いシーンを手前へ寄せ、近すぎる部分を見える範囲へ
-  戻します。
+  ズームと移動後に現在見えている範囲へ追従し、遠いシーンを手前へ寄せ、近すぎる
+  部分を見える範囲へ戻します。シーン切り替えや危険な手前表示では、手動のピント
+  固定を自動的に解除することがあります。
+- **Resume Auto:** クリックで固定したピントを解除し、その時点で見えている範囲の
+  自動配置へ戻します。
 - **Focus Trim:** 自動配置またはクリック後の奥行きを微調整します。
 - **Reset Zoom / Pan:** 拡大率と表示位置を初期状態へ戻します。
 
