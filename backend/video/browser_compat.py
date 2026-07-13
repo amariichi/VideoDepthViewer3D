@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import os
 import threading
 from fractions import Fraction
 from pathlib import Path
@@ -29,9 +31,33 @@ def _even_dimension(value: int) -> int:
     return value if value % 2 == 0 else value + 1
 
 
+def _nvidia_runtime_available() -> bool:
+    """Return whether NVENC has a real NVIDIA runtime to talk to.
+
+    FFmpeg/PyAV can list ``h264_nvenc`` even on machines without an NVIDIA
+    device. Trying that advertised codec can then take a long time to fail,
+    especially on headless CI runners, before the portable encoder is tried.
+    """
+
+    if os.name == "nt":
+        try:
+            ctypes.CDLL("nvcuda.dll")
+        except OSError:
+            return False
+        return True
+    return any(
+        path.exists()
+        for path in (
+            Path("/dev/nvidia0"),
+            Path("/dev/nvidiactl"),
+            Path("/dev/dxg"),  # WSL GPU bridge
+        )
+    )
+
+
 def _encoder_candidates() -> list[tuple[str, dict[str, str]]]:
     candidates: list[tuple[str, dict[str, str]]] = []
-    if "h264_nvenc" in av.codecs_available:
+    if "h264_nvenc" in av.codecs_available and _nvidia_runtime_available():
         candidates.append(
             (
                 "h264_nvenc",

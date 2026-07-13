@@ -5,12 +5,28 @@ import threading
 import av
 import pytest
 
+from backend.video import browser_compat
 from backend.utils.calibration import build_fallback_calibration
 from backend.video.browser_compat import (
     BrowserVideoPreparationCancelled,
     transcode_browser_video,
 )
 from backend.video.io import FrameDecoder
+
+
+@pytest.fixture(autouse=True)
+def use_portable_encoder_in_browser_copy_tests(monkeypatch) -> None:
+    """Keep media regression tests independent of local GPU/driver state."""
+
+    monkeypatch.setattr(browser_compat, "_nvidia_runtime_available", lambda: False)
+
+
+def test_encoder_candidates_skip_nvenc_without_nvidia_runtime() -> None:
+    candidates = browser_compat._encoder_candidates()
+
+    assert all(name != "h264_nvenc" for name, _options in candidates)
+    if "libx264" in av.codecs_available:
+        assert candidates[0][0] == "libx264"
 
 
 def test_browser_copy_is_seekable_h264(fast_media_dir, tmp_path) -> None:
