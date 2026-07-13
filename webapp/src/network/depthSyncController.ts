@@ -1,10 +1,12 @@
 import type { DepthStatus, PerfSettings } from '../types';
 import { getAutoMaxInflight, getSuggestedDepthLeadMs } from './depthSyncPolicy';
-import { getSessionStatus } from './sessionApi';
+import { getSessionStatus, isSessionGoneError } from './sessionApi';
 
 export class DepthSyncController {
     private intervalId: number | null = null;
     private sessionId: string | null = null;
+    private generation = 0;
+    private requestController: AbortController | null = null;
     private getState: () => { perfSettings: PerfSettings };
     private updatePerfSettings: (settings: Partial<PerfSettings>) => void;
 
@@ -19,10 +21,13 @@ export class DepthSyncController {
     start(sessionId: string) {
         this.stop();
         this.sessionId = sessionId;
-        this.intervalId = window.setInterval(() => this.tick(), 500);
+        this.intervalId = window.setInterval(() => void this.tick(), 500);
     }
 
     stop() {
+        this.generation += 1;
+        this.requestController?.abort();
+        this.requestController = null;
         if (this.intervalId !== null) {
             window.clearInterval(this.intervalId);
             this.intervalId = null;
@@ -31,13 +36,38 @@ export class DepthSyncController {
     }
 
     private async tick() {
-        if (!this.sessionId) return;
+        const sessionId = this.sessionId;
+        if (!sessionId || this.requestController) return;
+        const generation = this.generation;
+        const controller = new AbortController();
+        this.requestController = controller;
 
         try {
-            const status = await getSessionStatus(this.sessionId);
+            const status = await getSessionStatus(sessionId, controller.signal);
+            if (
+                controller.signal.aborted ||
+                generation !== this.generation ||
+                sessionId !== this.sessionId
+            ) {
+                return;
+            }
             this.adjustSettings(status);
         } catch (e) {
+            if (
+                controller.signal.aborted ||
+                generation !== this.generation ||
+                isSessionGoneError(e)
+            ) {
+                if (isSessionGoneError(e) && generation === this.generation) {
+                    this.stop();
+                }
+                return;
+            }
             console.error('SyncController poll failed', e);
+        } finally {
+            if (this.requestController === controller) {
+                this.requestController = null;
+            }
         }
     }
 

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
+import re
+import shutil
+import threading
 import time
 import uuid
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Optional
@@ -23,7 +28,12 @@ from backend.utils.adaptive_quality import (
 )
 from backend.utils.calibration import CameraCalibration, build_fallback_calibration
 from backend.utils.depth_range import StableDepthRange
+from backend.video.browser_compat import (
+    BrowserVideoPreparationCancelled,
+    transcode_browser_video,
+)
 from backend.video.io import DecoderPool, VideoMetadata
+from backend.video.playback import PlaybackChannel
 
 
 @dataclass
@@ -40,7 +50,11 @@ class VideoSession:
     source_path: Path
     metadata: VideoMetadata
     decoder: DecoderPool  # Changed from FrameDecoder
+    source_name: str = "video.mp4"
+    media_type: str = "video/mp4"
     calibration: CameraCalibration = field(init=False)
+    playback: PlaybackChannel = field(init=False, repr=False)
+    browser_video_path: Path = field(init=False)
     quality_controller: AdaptiveQualityController = field(init=False, repr=False)
     depth_range: StableDepthRange = field(init=False, repr=False)
     depth_buffer: Deque[DepthFrame] = field(init=False)
@@ -63,10 +77,22 @@ class VideoSession:
     _buffer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, init=False)
     _delivery_window_start_s: float | None = field(default=None, repr=False, init=False)
     _delivery_window_count: int = field(default=0, repr=False, init=False)
+    _browser_video_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, init=False
+    )
+    _browser_video_cancel: threading.Event = field(
+        default_factory=threading.Event, repr=False, init=False
+    )
+    _browser_video_task: asyncio.Task[Path] | None = field(
+        default=None, repr=False, init=False
+    )
+    _closed: bool = field(default=False, repr=False, init=False)
 
     def __post_init__(self) -> None:
         settings = get_settings()
         self.depth_buffer = deque(maxlen=settings.video_cache_size)
+        self.playback = PlaybackChannel(self.metadata.duration_ms)
+        self.browser_video_path = self.source_path.parent / "browser-video.mp4"
         self.calibration = build_fallback_calibration(
             source_width=self.metadata.width,
             source_height=self.metadata.height,
@@ -229,6 +255,60 @@ class VideoSession:
             "rolling_stats": rolling,
         }
 
+    async def close(self) -> None:
+        self._closed = True
+        self._browser_video_cancel.set()
+        browser_video_task = self._browser_video_task
+        if browser_video_task is not None:
+            with suppress(Exception, asyncio.CancelledError):
+                await browser_video_task
+        await self.playback.close()
+        # DecoderPool.close waits for in-flight PyAV calls. Run that wait off
+        # the event loop so control/session-ended messages can still drain.
+        await asyncio.to_thread(self.decoder.close)
+
+    async def prepare_browser_video(self) -> Path:
+        """Prepare one shared H.264 display copy for browsers lacking the codec."""
+
+        if self._closed:
+            raise BrowserVideoPreparationCancelled
+        if self.browser_video_path.is_file() and self.browser_video_path.stat().st_size > 0:
+            return self.browser_video_path
+
+        async with self._browser_video_lock:
+            if self._closed:
+                raise BrowserVideoPreparationCancelled
+            if (
+                self.browser_video_path.is_file()
+                and self.browser_video_path.stat().st_size > 0
+            ):
+                return self.browser_video_path
+            task = self._browser_video_task
+            if task is None or task.done():
+                self._browser_video_cancel.clear()
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        transcode_browser_video,
+                        self.source_path,
+                        self.browser_video_path,
+                        self.calibration,
+                        self._browser_video_cancel,
+                    )
+                )
+                self._browser_video_task = task
+
+        try:
+            return await asyncio.shield(task)
+        except Exception:
+            async with self._browser_video_lock:
+                if self._browser_video_task is task:
+                    self._browser_video_task = None
+            raise
+
+
+class InvalidVideoError(ValueError):
+    """Raised when uploaded bytes cannot be opened as a video."""
+
 
 class SessionManager:
     """Tracks active sessions and temporary files."""
@@ -236,73 +316,108 @@ class SessionManager:
     def __init__(self) -> None:
         self.settings = get_settings()
         self._sessions: dict[str, VideoSession] = {}
+        self._current_session_id: str | None = None
         self._lock = asyncio.Lock()
 
     async def create_session(self, upload: UploadFile) -> VideoSession:
-        await self.clear_cache()
         data_root = self.settings.data_root
         data_root.mkdir(parents=True, exist_ok=True)
         session_id = uuid.uuid4().hex
         session_dir = data_root / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
-        target = session_dir / "source.mp4"
-        with target.open("wb") as dst:
-            while chunk := await upload.read(1024 * 1024):
-                dst.write(chunk)
-        
-        decoder = DecoderPool(target, count=self.settings.decoder_worker_count)
-        metadata = decoder.metadata()
-        session = VideoSession(
-            session_id=session_id,
-            source_path=target,
-            metadata=metadata,
-            decoder=decoder,
+        raw_name = (upload.filename or "video.mp4").replace("\\", "/")
+        source_name = Path(raw_name).name or "video.mp4"
+        suffix = Path(source_name).suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+            suffix = ".mp4"
+        target = session_dir / f"source{suffix}"
+        guessed_type = mimetypes.guess_type(source_name)[0]
+        media_type = (
+            upload.content_type
+            if upload.content_type and upload.content_type.startswith("video/")
+            else guessed_type or "application/octet-stream"
         )
+        decoder: DecoderPool | None = None
+        try:
+            with target.open("wb") as dst:
+                while chunk := await upload.read(1024 * 1024):
+                    dst.write(chunk)
+
+            decoder = DecoderPool(target, count=self.settings.decoder_worker_count)
+            metadata = decoder.metadata()
+            session = VideoSession(
+                session_id=session_id,
+                source_path=target,
+                metadata=metadata,
+                decoder=decoder,
+                source_name=source_name,
+                media_type=media_type,
+            )
+        except asyncio.CancelledError:
+            if decoder is not None:
+                decoder.close()
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise
+        except Exception as exc:
+            if decoder is not None:
+                decoder.close()
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise InvalidVideoError(
+                "The selected file could not be decoded as a supported video."
+            ) from exc
+        # Publish only after the new upload has been fully written and probed.
+        # This keeps the current video alive during a long phone upload and
+        # preserves it when the replacement is invalid.
         async with self._lock:
-            self._sessions[session_id] = session
+            previous_sessions = tuple(self._sessions.values())
+            self._sessions = {session_id: session}
+            self._current_session_id = session_id
+        for previous in previous_sessions:
+            await self._dispose_session(previous)
         return session
 
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
             session = self._sessions.pop(session_id, None)
+            if self._current_session_id == session_id:
+                self._current_session_id = None
         if session:
-            session.decoder.close()
-            if session.source_path.exists():
-                session.source_path.unlink()
-            session_dir = session.source_path.parent
-            if session_dir.exists():
-                for child in session_dir.iterdir():
-                    child.unlink(missing_ok=True)
-                session_dir.rmdir()
+            await self._dispose_session(session)
 
     async def get(self, session_id: str) -> Optional[VideoSession]:
         async with self._lock:
             return self._sessions.get(session_id)
 
+    async def current(self) -> Optional[VideoSession]:
+        async with self._lock:
+            if self._current_session_id is None:
+                return None
+            return self._sessions.get(self._current_session_id)
+
     async def clear_cache(self) -> None:
         data_root = self.settings.data_root
         default_root = Path("tmp/sessions").resolve()
         data_root_resolved = data_root.resolve()
-        if data_root_resolved != default_root and not self.settings.clear_cache_override:
+        can_sweep_root = (
+            data_root_resolved == default_root or self.settings.clear_cache_override
+        )
+        if not can_sweep_root:
             logging.getLogger(__name__).warning(
-                "Skipping cache cleanup for data_root=%s (set VIDEO_DEPTH_CLEAR_CACHE=1 to override).",
+                "Skipping untracked cache cleanup for data_root=%s "
+                "(set VIDEO_DEPTH_CLEAR_CACHE=1 to override).",
                 data_root_resolved,
             )
-            return
 
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._current_session_id = None
 
         for session in sessions:
-            session.decoder.close()
-            if session.source_path.exists():
-                session.source_path.unlink()
-            session_dir = session.source_path.parent
-            if session_dir.exists():
-                for child in session_dir.iterdir():
-                    child.unlink(missing_ok=True)
-                session_dir.rmdir()
+            await self._dispose_session(session)
+
+        if not can_sweep_root:
+            return
 
         if data_root.exists():
             for child in data_root.iterdir():
@@ -312,6 +427,18 @@ class SessionManager:
                     child.rmdir()
                 else:
                     child.unlink(missing_ok=True)
+
+    @staticmethod
+    async def _dispose_session(session: VideoSession) -> None:
+        """Close one known session before removing its private UUID directory."""
+
+        await session.close()
+        session_dir = session.source_path.parent
+        # Windows can briefly retain a FileResponse handle while a browser
+        # abandons the old Range request. Session replacement must still
+        # succeed; an undeleted private cache directory is safe to retry during
+        # the next startup sweep.
+        shutil.rmtree(session_dir, ignore_errors=True)
 
 
 def get_session_manager() -> SessionManager:

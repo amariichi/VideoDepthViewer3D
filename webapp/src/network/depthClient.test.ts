@@ -58,6 +58,7 @@ function depthPacket(timestampMs: number): ArrayBuffer {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.resetModules();
   FakeWebSocket.instances = [];
@@ -111,5 +112,62 @@ describe('DepthClient response flow control', () => {
     socket.receive(JSON.stringify({ type: 'miss', time_ms: 200 }));
 
     expect(client.getInflightCount()).toBe(0);
+  });
+
+  it('silently closes when its session has been replaced', async () => {
+    vi.stubGlobal('window', { location: { origin: 'http://127.0.0.1:5174' } });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response(null, { status: 404 }))
+    );
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { DepthClient } = await import('./depthClient');
+    const client = new DepthClient('old-session', () => ({
+      mode: 'balanced',
+      autoLead: true,
+      depthLeadMs: 100,
+      maxInflightRequests: 9,
+    }));
+    client.connect();
+
+    await expect(client.getStats()).resolves.toBeNull();
+
+    expect(FakeWebSocket.instances[0].readyState).toBe(3);
+    expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it('aborts an in-flight stats request when closed', async () => {
+    vi.stubGlobal('window', { location: { origin: 'http://127.0.0.1:5174' } });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    let requestSignal: AbortSignal | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        requestSignal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => {
+          requestSignal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('aborted', 'AbortError')),
+            { once: true }
+          );
+        });
+      })
+    );
+    const { DepthClient } = await import('./depthClient');
+    const client = new DepthClient('old-session', () => ({
+      mode: 'balanced',
+      autoLead: true,
+      depthLeadMs: 100,
+      maxInflightRequests: 9,
+    }));
+    client.connect();
+
+    const stats = client.getStats();
+    await Promise.resolve();
+    client.close();
+
+    expect(requestSignal?.aborted).toBe(true);
+    await expect(stats).resolves.toBeNull();
   });
 });

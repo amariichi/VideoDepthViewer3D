@@ -1,5 +1,7 @@
 export interface SessionInfo {
   sessionId: string;
+  sourceName: string;
+  mediaType: string;
   width: number;
   height: number;
   displayWidth: number;

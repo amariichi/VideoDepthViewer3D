@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
 import av
 import numpy as np
-import threading
 
 from backend.utils.frame_info import FrameInfo, frame_info_from_av
 from backend.utils.calibration import (
@@ -222,26 +222,32 @@ class DecoderPool:
         self._free_decoders = list(self._decoders)
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
+        self._closed = False
 
     def metadata(self) -> VideoMetadata:
         # Just peek at one decoder
         with self._cond:
-            while not self._free_decoders:
+            while not self._free_decoders and not self._closed:
                 self._cond.wait()
+            if self._closed:
+                raise RuntimeError("decoder pool is closed")
             decoder = self._free_decoders.pop()
         
         try:
             return decoder.metadata()
         finally:
             with self._cond:
-                self._free_decoders.append(decoder)
-                self._cond.notify()
+                if decoder in self._decoders:
+                    self._free_decoders.append(decoder)
+                self._cond.notify_all()
 
     def decode_at(self, time_ms: float) -> tuple[np.ndarray, FrameInfo]:
         # Block until a decoder is available
         with self._cond:
-            while not self._free_decoders:
+            while not self._free_decoders and not self._closed:
                 self._cond.wait()
+            if self._closed:
+                raise RuntimeError("decoder pool is closed")
             
             # Smart Scheduling: Find a decoder that is close to the target time
             # to avoid expensive seeking.
@@ -262,15 +268,27 @@ class DecoderPool:
             return best_decoder.decode_at(time_ms)
         finally:
             with self._cond:
-                self._free_decoders.append(best_decoder)
-                self._cond.notify()
+                if best_decoder in self._decoders:
+                    self._free_decoders.append(best_decoder)
+                self._cond.notify_all()
 
     def close(self) -> None:
-        with self._lock:
-            for decoder in self._decoders:
-                try:
-                    decoder.close()
-                except Exception:
-                    pass
+        # PyAV containers must never be closed while another thread is inside
+        # av_read_frame. Session replacement can race with asyncio.to_thread()
+        # decodes, so reject new checkouts and wait for every borrowed decoder
+        # to return before closing its container.
+        with self._cond:
+            if self._closed:
+                return
+            self._closed = True
+            self._cond.notify_all()
+            while len(self._free_decoders) < len(self._decoders):
+                self._cond.wait()
+            decoders = tuple(self._decoders)
             self._decoders.clear()
             self._free_decoders.clear()
+        for decoder in decoders:
+            try:
+                decoder.close()
+            except Exception:
+                pass

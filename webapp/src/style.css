@@ -10,6 +10,33 @@ body {
   @apply bg-tropical-bg text-tropical-text;
 }
 
+.remote-safe-area {
+  padding-top: max(1rem, env(safe-area-inset-top));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  padding-left: max(1rem, env(safe-area-inset-left));
+}
+
+.remote-progress {
+  overflow: hidden;
+  border: 0;
+  border-radius: 9999px;
+  background: #e0f2f1;
+  color: #00897b;
+}
+
+.remote-progress::-webkit-progress-bar {
+  background: #e0f2f1;
+}
+
+.remote-progress::-webkit-progress-value {
+  background: #00897b;
+}
+
+.remote-progress::-moz-progress-bar {
+  background: #00897b;
+}
+
 /* Custom overrides for lil-gui to match light theme */
 .lil-gui {
   --background-color: #ffffff;
