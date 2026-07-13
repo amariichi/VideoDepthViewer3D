@@ -287,8 +287,16 @@ async def depth_stream(
                 
                 get_task = asyncio.create_task(request_queue.get())
                 stop_task = asyncio.create_task(stop.wait())
-                done, _ = await asyncio.wait([get_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
-                await cancel_pending(get_task, stop_task)
+                try:
+                    done, _ = await asyncio.wait(
+                        [get_task, stop_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    # The parent can be cancelled while asyncio.wait is still
+                    # pending. Always reap its child queue waits so repeated
+                    # mobile session replacement cannot leak tasks.
+                    await cancel_pending(get_task, stop_task)
                 
                 if stop_task in done:
                     break
@@ -339,8 +347,13 @@ async def depth_stream(
             try:
                 get_task = asyncio.create_task(send_queue.get())
                 stop_task = asyncio.create_task(stop.wait())
-                done, _ = await asyncio.wait([get_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
-                await cancel_pending(get_task, stop_task)
+                try:
+                    done, _ = await asyncio.wait(
+                        [get_task, stop_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    await cancel_pending(get_task, stop_task)
                 
                 if stop_task in done:
                     break

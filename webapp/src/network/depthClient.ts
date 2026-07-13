@@ -1,6 +1,6 @@
 import type { DepthFrame, DepthStatus, PerfSettings } from '../types';
 import { wsUrl } from '../utils/env';
-import { getSessionStatus } from './sessionApi';
+import { getSessionStatus, isSessionGoneError } from './sessionApi';
 import { decodeDepthPacket } from './depthPacket';
 
 type DepthListener = (frame: DepthFrame) => void;
@@ -19,6 +19,8 @@ export class DepthClient {
   private requestTimes = new Map<number, number>();
   private rtt = 0;
   private rttAlpha = 0.1; // EMA factor
+  private closed = true;
+  private statsRequests = new Set<AbortController>();
   // debug counters (currently unused)
   private dbg = { droppedUnknown: 0 };
 
@@ -33,23 +35,30 @@ export class DepthClient {
   }
 
   connect(): void {
+    this.closed = false;
     const url = wsUrl(`/api/sessions/${this.sessionId}/stream`);
-    this.socket = new WebSocket(url);
-    this.socket.binaryType = 'arraybuffer';
-    this.socket.onopen = () => {
+    const socket = new WebSocket(url);
+    this.socket = socket;
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = () => {
+      if (this.socket !== socket) return;
       if (import.meta.env.DEV) console.debug('depth ws open');
       this.emitStatus(true);
       this.flushQueue();
     };
-    this.socket.onclose = () => {
+    socket.onclose = () => {
+      if (this.socket !== socket) return;
+      this.socket = null;
       if (import.meta.env.DEV) console.debug('depth ws closed');
       this.emitStatus(false);
     };
-    this.socket.onerror = (event) => {
+    socket.onerror = (event) => {
+      if (this.socket !== socket) return;
       console.error('depth ws error', event);
       this.emitStatus(false);
     };
-    this.socket.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.socket !== socket) return;
       if (typeof event.data === 'string') {
         try {
           const payload = JSON.parse(event.data) as {
@@ -123,11 +132,14 @@ export class DepthClient {
   }
 
   close(): void {
-    if (this.socket) {
-      this.socket.close();
-      this.socket = null;
-    }
+    this.closed = true;
+    const socket = this.socket;
+    this.socket = null;
+    socket?.close();
+    for (const controller of this.statsRequests) controller.abort();
+    this.statsRequests.clear();
     this.resetStreamState();
+    this.emitStatus(false);
   }
 
   resetStreamState(): void {
@@ -141,6 +153,7 @@ export class DepthClient {
   }
 
   requestDepth(timeMs: number): void {
+    if (this.closed) return;
     this.enqueueRequest(timeMs);
     this.flushQueue();
   }
@@ -311,11 +324,25 @@ export class DepthClient {
   }
 
   async getStats(): Promise<DepthStatus | null> {
+    if (this.closed) return null;
+    const controller = new AbortController();
+    this.statsRequests.add(controller);
     try {
-      return await getSessionStatus(this.sessionId);
+      const status = await getSessionStatus(this.sessionId, controller.signal);
+      return this.closed ? null : status;
     } catch (e) {
+      if (
+        this.closed ||
+        controller.signal.aborted ||
+        isSessionGoneError(e)
+      ) {
+        if (isSessionGoneError(e) && !this.closed) this.close();
+        return null;
+      }
       console.error('getStats error', e);
       return null;
+    } finally {
+      this.statsRequests.delete(controller);
     }
   }
 }

@@ -1,5 +1,18 @@
 #!/bin/bash
 
+FRONTEND_ARGS=()
+case "${1:-}" in
+    "")
+        ;;
+    --lan)
+        FRONTEND_ARGS=(-- --host 0.0.0.0)
+        ;;
+    *)
+        echo "Usage: ./start.sh [--lan]"
+        exit 2
+        ;;
+esac
+
 # Function to kill all child processes on exit
 cleanup() {
     echo "Stopping VideoDepthViewer3D..."
@@ -22,13 +35,17 @@ uv run --locked --extra inference python3 scripts/run_backend.py --reload &
 BACKEND_PID=$!
 
 # Start Frontend
-echo "Starting Frontend..."
+if [ "${1:-}" = "--lan" ]; then
+    echo "Starting Frontend for trusted LAN access..."
+else
+    echo "Starting Frontend..."
+fi
 cd webapp
 if [ ! -d "node_modules" ]; then
     echo "Installing frontend dependencies..."
     npm ci
 fi
-npm run dev &
+npm run dev "${FRONTEND_ARGS[@]}" &
 FRONTEND_PID=$!
 
 # Wait for both processes

@@ -3,9 +3,17 @@ import {
   VIDEO_TRANSFER_STATUS,
   deleteSession,
   describeVideoTransferError,
+  getCurrentSession,
+  getBrowserVideoUrl,
+  getSessionVideoUrl,
+  prepareBrowserVideo,
   uploadVideo,
 } from './network/sessionApi';
 import { DepthClient } from './network/depthClient';
+import {
+  PlaybackControlClient,
+  type PlaybackEvent,
+} from './network/playbackControl';
 import { RenderScene } from './render/scene';
 import { usePlayerStore } from './state/playerStore';
 import { RawXRTest } from './xrTest';
@@ -76,6 +84,15 @@ export class VideoDepthApp {
   private suppressSeekRefresh = false;
   private lastAppliedDepthTimestamp = -1;
   private currentSyncDeltaMs = 0;
+  private sessionOwnedByViewer = false;
+  private sessionTransitionActive = false;
+  private sessionDiscoveryInFlight = false;
+  private playbackControl: PlaybackControlClient | null = null;
+  private playbackStateIntervalId: number | null = null;
+  private playbackEventSuppressionUntil = 0;
+  private pendingRemotePlaybackEvent: PlaybackEvent | null = null;
+  private activeObjectUrl: string | null = null;
+  private videoLoadGeneration = 0;
 
   constructor(root: HTMLElement) {
     // ... (existing constructor code)
@@ -88,7 +105,12 @@ export class VideoDepthApp {
     root.querySelector('#video-container')?.appendChild(video);
     this.videoEl = video;
     this.videoEl.addEventListener('ended', () => this.handleVideoEnded());
-    this.videoEl.addEventListener('seeked', () => this.handleVideoSeeked());
+    this.videoEl.addEventListener('seeked', () => {
+      this.handleVideoSeeked();
+      this.publishPlaybackState();
+    });
+    this.videoEl.addEventListener('play', () => this.publishPlaybackState());
+    this.videoEl.addEventListener('pause', () => this.publishPlaybackState());
     usePlayerStore.getState().setVideo(video);
 
     const canvasContainer = root.querySelector('#canvas-container') as HTMLElement;
@@ -204,6 +226,7 @@ export class VideoDepthApp {
     });
 
     this.startRenderLoop();
+    this.startSessionDiscovery();
   }
 
   private applyLookingGlassViewConfig(): void {
@@ -951,21 +974,12 @@ export class VideoDepthApp {
   }
 
   private async handleFileSelected(file: File): Promise<void> {
+    this.sessionTransitionActive = true;
     try {
       await this.cleanupSession();
       this.controlPanel.updateStatus(VIDEO_TRANSFER_STATUS);
       const session = await uploadVideo(file);
-      this.currentSession = session;
-      usePlayerStore.getState().setSession(session);
-      usePlayerStore.getState().updateControls({ framingMode: 'source' });
-      this.controlPanel.setFramingMode('source');
-      this.renderScene.setCalibration(session.calibration);
-      this.rawXR?.setCalibration(session.calibration);
-      this.controlPanel.updateStatus(
-        `Session ${session.sessionId} (${session.displayWidth}x${session.displayHeight})`
-      );
-      this.openVideo(file);
-      this.openDepthStream(session);
+      this.activateSession(session, file, true);
     } catch (error) {
       console.error('Failed to create video session', error);
       this.currentSession = null;
@@ -973,20 +987,124 @@ export class VideoDepthApp {
       usePlayerStore.getState().setDepthConnected(false);
       this.controlPanel.updateStatus(describeVideoTransferError(error));
       this.resumeRenderLoop();
+    } finally {
+      this.sessionTransitionActive = false;
     }
   }
 
-  private openVideo(file: File): void {
-    const objectUrl = URL.createObjectURL(file);
-    this.videoEl.src = objectUrl;
-    const onLoaded = () => {
-      this.renderScene.updateVideo(this.videoEl);
-      this.videoEl.removeEventListener('loadeddata', onLoaded);
-      this.startDepthPolling();
-      this.startRenderLoop(); // Restart render loop
+  private activateSession(
+    session: SessionInfo,
+    source: File | string,
+    ownedByViewer: boolean
+  ): void {
+    this.currentSession = session;
+    this.sessionOwnedByViewer = ownedByViewer;
+    usePlayerStore.getState().setSession(session);
+    usePlayerStore.getState().updateControls({ framingMode: 'source' });
+    this.controlPanel.setFramingMode('source');
+    this.renderScene.setCalibration(session.calibration);
+    this.rawXR?.setCalibration(session.calibration);
+    this.controlPanel.updateStatus(
+      `${ownedByViewer ? 'Local' : 'Mobile'} session ${session.sourceName} (${session.displayWidth}x${session.displayHeight})`
+    );
+    this.pendingRemotePlaybackEvent = null;
+    this.openVideoSource(source, session);
+    this.openDepthStream(session);
+    this.connectPlaybackControl(session);
+  }
+
+  private openVideoSource(source: File | string, session: SessionInfo): void {
+    if (this.activeObjectUrl) {
+      URL.revokeObjectURL(this.activeObjectUrl);
+      this.activeObjectUrl = null;
+    }
+    const sourceUrl =
+      typeof source === 'string'
+        ? source
+        : (this.activeObjectUrl = URL.createObjectURL(source));
+    const generation = ++this.videoLoadGeneration;
+    const sessionStatus = () =>
+      `${this.sessionOwnedByViewer ? 'Local' : 'Mobile'} session ${session.sourceName} (${session.displayWidth}x${session.displayHeight})`;
+
+    const load = (url: string, allowCompatibilityFallback: boolean): void => {
+      if (generation !== this.videoLoadGeneration) return;
+      const cleanupListeners = () => {
+        this.videoEl.removeEventListener('loadeddata', onLoaded);
+        this.videoEl.removeEventListener('error', onError);
+      };
+      const onLoaded = () => {
+        cleanupListeners();
+        if (
+          generation !== this.videoLoadGeneration ||
+          this.currentSession?.sessionId !== session.sessionId
+        ) {
+          return;
+        }
+        this.controlPanel.updateStatus(sessionStatus());
+        this.renderScene.updateVideo(this.videoEl);
+        this.startDepthPolling();
+        this.startRenderLoop(); // Restart render loop
+        const pendingEvent = this.pendingRemotePlaybackEvent;
+        this.pendingRemotePlaybackEvent = null;
+        if (pendingEvent) this.applyRemotePlaybackEvent(pendingEvent);
+        this.publishPlaybackState();
+      };
+      const onError = () => {
+        cleanupListeners();
+        if (
+          generation !== this.videoLoadGeneration ||
+          this.currentSession?.sessionId !== session.sessionId
+        ) {
+          return;
+        }
+        const mediaErrorCode = this.videoEl.error?.code;
+        const unsupported =
+          mediaErrorCode === MediaError.MEDIA_ERR_DECODE ||
+          mediaErrorCode === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED;
+        if (!allowCompatibilityFallback || !unsupported) {
+          this.controlPanel.updateStatus(
+            'This browser could not play the selected video codec'
+          );
+          return;
+        }
+        this.controlPanel.updateStatus(
+          'Preparing a browser-compatible video. The original remains unchanged...'
+        );
+        void prepareBrowserVideo(session.sessionId)
+          .then(() => {
+            if (
+              generation === this.videoLoadGeneration &&
+              this.currentSession?.sessionId === session.sessionId
+            ) {
+              load(getBrowserVideoUrl(session.sessionId), false);
+            }
+          })
+          .catch((error) => {
+            if (generation !== this.videoLoadGeneration) return;
+            console.error('Failed to prepare browser-compatible video', error);
+            this.controlPanel.updateStatus(
+              error instanceof Error
+                ? error.message
+                : 'Could not prepare this codec for browser playback'
+            );
+          });
+      };
+
+      this.videoEl.src = url;
+      this.videoEl.addEventListener('loadeddata', onLoaded);
+      this.videoEl.addEventListener('error', onError);
+      this.videoEl.load();
+      void this.videoEl.play().catch((error: unknown) => {
+        if (
+          generation === this.videoLoadGeneration &&
+          error instanceof DOMException &&
+          error.name === 'NotAllowedError'
+        ) {
+          this.controlPanel.updateStatus('Video ready; press play to begin');
+        }
+      });
     };
-    this.videoEl.addEventListener('loadeddata', onLoaded);
-    this.videoEl.play();
+    load(sourceUrl, true);
   }
 
   private openDepthStream(session: SessionInfo): void {
@@ -1007,6 +1125,165 @@ export class VideoDepthApp {
     this.lastAppliedDepthTimestamp = -1;
     this.latestDepthFrame = null;
     this.startHealthReporting();
+  }
+
+  private connectPlaybackControl(session: SessionInfo): void {
+    this.playbackControl?.close();
+    if (this.playbackStateIntervalId !== null) {
+      window.clearInterval(this.playbackStateIntervalId);
+    }
+    const control = new PlaybackControlClient(session.sessionId, 'viewer');
+    this.playbackControl = control;
+    control.onEvent((event) => {
+      if (this.playbackControl !== control) return;
+      this.handlePlaybackControlEvent(event);
+    });
+    control.onStatus((connected) => {
+      if (!connected || this.playbackControl !== control) return;
+      window.setTimeout(() => {
+        if (this.playbackControl === control) this.publishPlaybackState();
+      }, 150);
+    });
+    control.connect();
+    this.playbackStateIntervalId = window.setInterval(
+      () => this.publishPlaybackState(),
+      500
+    );
+  }
+
+  private handlePlaybackControlEvent(event: PlaybackEvent): void {
+    if (event.type === 'session-ended') {
+      this.controlPanel.updateStatus('Mobile session ended; waiting for a video');
+      const sessionId = this.currentSession?.sessionId;
+      if (sessionId) void this.detachEndedSession(sessionId);
+      return;
+    }
+    if (event.type === 'error') {
+      console.warn('Playback control error', event.message);
+      return;
+    }
+    if (
+      event.originRole !== 'remote' ||
+      event.currentTimeMs === undefined ||
+      event.paused === undefined
+    ) {
+      return;
+    }
+
+    if (this.videoEl.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      this.applyRemotePlaybackEvent(event);
+    } else {
+      this.pendingRemotePlaybackEvent = event;
+    }
+  }
+
+  private async detachEndedSession(sessionId: string): Promise<void> {
+    if (
+      this.sessionTransitionActive ||
+      this.currentSession?.sessionId !== sessionId
+    ) {
+      return;
+    }
+    this.sessionTransitionActive = true;
+    try {
+      await this.cleanupSession(false);
+      this.controlPanel.updateStatus('Waiting for a local or mobile video');
+      this.resumeRenderLoop();
+    } finally {
+      this.sessionTransitionActive = false;
+    }
+    // A replacement may already be ready. If an upload is still in progress,
+    // the regular discovery interval will attach it when creation completes.
+    await this.pollCurrentSession();
+  }
+
+  private applyRemotePlaybackEvent(event: PlaybackEvent): void {
+    if (
+      !this.currentSession ||
+      event.currentTimeMs === undefined ||
+      event.paused === undefined
+    ) {
+      return;
+    }
+    this.playbackEventSuppressionUntil = performance.now() + 750;
+    const targetSeconds = event.currentTimeMs / 1000;
+    if (
+      event.action === 'seek' ||
+      Math.abs(this.videoEl.currentTime - targetSeconds) > 0.2
+    ) {
+      this.videoEl.currentTime = targetSeconds;
+    }
+    if (event.paused) {
+      this.videoEl.pause();
+    } else {
+      void this.videoEl.play().catch(() => {
+        this.controlPanel.updateStatus(
+          'Remote play is ready; tap the desktop player once to allow playback'
+        );
+      });
+    }
+    window.setTimeout(() => this.publishPlaybackState(true), 50);
+  }
+
+  private publishPlaybackState(force = false): void {
+    if (
+      !this.playbackControl ||
+      !this.currentSession ||
+      this.videoEl.readyState < HTMLMediaElement.HAVE_METADATA ||
+      (!force && performance.now() < this.playbackEventSuppressionUntil)
+    ) {
+      return;
+    }
+    this.playbackControl.sendState(
+      this.videoEl.currentTime * 1000,
+      this.videoEl.paused
+    );
+  }
+
+  private startSessionDiscovery(): void {
+    const poll = () => void this.pollCurrentSession();
+    poll();
+    window.setInterval(poll, 1_000);
+  }
+
+  private async pollCurrentSession(): Promise<void> {
+    if (this.sessionDiscoveryInFlight || this.sessionTransitionActive) return;
+    this.sessionDiscoveryInFlight = true;
+    try {
+      const session = await getCurrentSession();
+      if (this.sessionTransitionActive) return;
+      if (session && session.sessionId !== this.currentSession?.sessionId) {
+        await this.attachRemoteSession(session);
+      } else if (!session && this.currentSession && !this.sessionOwnedByViewer) {
+        this.sessionTransitionActive = true;
+        try {
+          await this.cleanupSession(false);
+          this.controlPanel.updateStatus('Waiting for a local or mobile video');
+          this.resumeRenderLoop();
+        } finally {
+          this.sessionTransitionActive = false;
+        }
+      }
+    } catch (error) {
+      if (import.meta.env.DEV) console.debug('Session discovery unavailable', error);
+    } finally {
+      this.sessionDiscoveryInFlight = false;
+    }
+  }
+
+  private async attachRemoteSession(session: SessionInfo): Promise<void> {
+    if (this.sessionTransitionActive) return;
+    this.sessionTransitionActive = true;
+    try {
+      await this.cleanupSession(false);
+      this.activateSession(session, getSessionVideoUrl(session.sessionId), false);
+    } catch (error) {
+      console.error('Failed to attach mobile session', error);
+      this.controlPanel.updateStatus('Could not open the mobile video session');
+      this.resumeRenderLoop();
+    } finally {
+      this.sessionTransitionActive = false;
+    }
   }
 
   private handleDepthFrame(frame: DepthFrame): void {
@@ -1196,7 +1473,7 @@ export class VideoDepthApp {
     this.depthRafId = window.requestAnimationFrame(loop);
   }
 
-  private async cleanupSession(): Promise<void> {
+  private async cleanupSession(deleteOwnedSession = true): Promise<void> {
     // Pause video immediately to stop rendering loop from asking for more frames
     if (this.videoEl) {
       this.videoEl.pause();
@@ -1208,15 +1485,24 @@ export class VideoDepthApp {
     await this.rawXR?.stop();
 
     const currentSession = this.currentSession;
+    const ownedByViewer = this.sessionOwnedByViewer;
     this.currentSession = null;
+    this.sessionOwnedByViewer = false;
     usePlayerStore.getState().setSession(null);
     usePlayerStore.getState().setDepthConnected(false);
-    if (currentSession) {
+    if (currentSession && ownedByViewer && deleteOwnedSession) {
       try {
         await deleteSession(currentSession.sessionId);
       } catch (e) {
         console.warn('Failed to delete session', e);
       }
+    }
+    this.playbackControl?.close();
+    this.playbackControl = null;
+    this.pendingRemotePlaybackEvent = null;
+    if (this.playbackStateIntervalId !== null) {
+      window.clearInterval(this.playbackStateIntervalId);
+      this.playbackStateIntervalId = null;
     }
     this.depthClient?.close();
     this.depthClient = null;
@@ -1233,6 +1519,13 @@ export class VideoDepthApp {
     this.lastAppliedDepthTimestamp = -1;
     this.latestDepthFrame = null;
     this.lastTargetTriangles = 0;
+    this.videoLoadGeneration += 1;
+    if (this.activeObjectUrl) {
+      URL.revokeObjectURL(this.activeObjectUrl);
+      this.activeObjectUrl = null;
+    }
+    this.videoEl.removeAttribute('src');
+    this.videoEl.load();
     this.renderScene.setCalibration(null);
     this.rawXR?.setCalibration(null);
     if (this.healthIntervalId !== null) {
@@ -1253,6 +1546,9 @@ export class VideoDepthApp {
       this.depthClient.close();
       this.depthClient.connect();
     }
+    // This reset must not be swallowed by suppression left over from a remote
+    // play or seek near the end of the video.
+    window.setTimeout(() => this.publishPlaybackState(true), 0);
     // Let the user press play again; depth polling loop will pick up from t=0
   }
 

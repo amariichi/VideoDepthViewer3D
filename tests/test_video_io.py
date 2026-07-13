@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
 from backend.utils.frame_info import FrameInfo
-from backend.video.io import FrameDecoder
+from backend.video.io import DecoderPool, FrameDecoder
 
 
 def test_frame_decoder_reads_generated_cfr_media(fast_media_dir: Path) -> None:
@@ -125,3 +127,62 @@ def test_decoder_reports_square_pixel_display_geometry(fast_media_dir: Path) -> 
         360,
         640,
     )
+
+
+def test_decoder_pool_waits_for_borrowed_decoder_before_close() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    decoder_closed = threading.Event()
+
+    class BlockingDecoder:
+        def should_stream_forward(self, _time_ms: float) -> bool:
+            return True
+
+        def decode_at(self, time_ms: float) -> tuple[np.ndarray, FrameInfo]:
+            started.set()
+            assert release.wait(timeout=2)
+            return (
+                np.zeros((1, 1, 3), dtype=np.uint8),
+                FrameInfo(time_ms=time_ms, index=0, pts=0, key_frame=True),
+            )
+
+        def close(self) -> None:
+            decoder_closed.set()
+
+    decoder = BlockingDecoder()
+    pool = object.__new__(DecoderPool)
+    pool.source = Path("generated.mp4")
+    pool.count = 1
+    pool._decoders = [decoder]
+    pool._free_decoders = [decoder]
+    pool._lock = threading.Lock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._closed = False
+    decode_errors: list[BaseException] = []
+
+    def decode() -> None:
+        try:
+            pool.decode_at(250.0)
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            decode_errors.append(exc)
+
+    decode_thread = threading.Thread(target=decode)
+    close_thread = threading.Thread(target=pool.close)
+    decode_thread.start()
+    assert started.wait(timeout=1)
+    close_thread.start()
+
+    deadline = time.monotonic() + 1
+    while not pool._closed and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert pool._closed
+    assert not decoder_closed.wait(timeout=0.05)
+
+    release.set()
+    decode_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert not decode_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert decode_errors == []
+    assert decoder_closed.is_set()
