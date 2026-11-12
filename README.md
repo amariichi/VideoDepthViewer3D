@@ -36,6 +36,8 @@ See [`OPTIMIZATION_DETAILS.md`](OPTIMIZATION_DETAILS.md) for implementation,
 calibration, and performance-measurement details.
 
 ### Setup & Run
+Requires Node.js 22.23.5+, 24.22.3+, or 26.13.1+ within those release lines for the frontend (24 recommended). These minimums include the November 2026 security fixes.
+
 1. **Install dependencies (uv):**
    ```bash
    uv venv .venv
@@ -451,6 +453,8 @@ VideoDepthViewer3Dは、動画をリアルタイムで立体表示するビュ�
 [`OPTIMIZATION_DETAILS.md`](OPTIMIZATION_DETAILS.md)を参照してください。
 
 ### セットアップと実行
+フロントエンドには Node.js 22.23.5 以上／24.22.3 以上／26.13.1 以上（各系列内、24系推奨）が必要です。2026年11月のセキュリティ修正を含む最低版です。
+
 1. **依存関係のインストール (uv):**
    ```bash
    uv venv .venv
